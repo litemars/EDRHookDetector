@@ -38,6 +38,8 @@ Common options:
 - `-l, --lib <PATH>`   Restrict inspection to a specific library path or filename
 - `-v, --verbose`      Verbose output (per-function details)
 - `-h, --help`         Show help
+- `-x, --hexdump`      Show hexdump of modified instructions
+- `-j, --json`         Output in JSON format
 
 Example: scan PID 1234 with verbose output
 

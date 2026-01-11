@@ -26,25 +26,26 @@ Build with the included Makefile:
 make
 ```
 
-Run the default scanner (binary: `edr_arm64_edr_hooks`) with root privileges for full scanning:
+Run the default scanner (binary: `arm64_edr_hooks_check`) with root privileges for full scanning:
 
 ```bash
-sudo ./edr_arm64_edr_hooks
+sudo ./arm64_edr_hooks_check
 ```
 
 Common options:
 
 - `-p, --pid <PID>`    Scan only the given process ID
 - `-l, --lib <PATH>`   Restrict inspection to a specific library path or filename
-- `-v, --verbose`      Verbose output (per-function details)
-- `-h, --help`         Show help
+- `-s, --self`         Scan only the current process (no root needed)
+- `-v, --verbose`      Verbose output (use twice for more detail)
 - `-x, --hexdump`      Show hexdump of modified instructions
 - `-j, --json`         Output in JSON format
+- `-h, --help`         Show help
 
 Example: scan PID 1234 with verbose output
 
 ```bash
-sudo ./edr_arm64_edr_hooks --pid 1234 --verbose
+sudo ./arm64_edr_hooks_check --pid 1234 --verbose
 ```
 
 

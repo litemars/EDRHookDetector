@@ -147,7 +147,6 @@ static const struct {
     {NULL, {NULL}}
 };
 
-// Pattern detection functions
 static int32_t get_branch_offset(uint32_t insn) {
     int32_t offset = (insn & 0x03FFFFFF) << 2;
     if (offset & 0x08000000) offset |= 0xF0000000;

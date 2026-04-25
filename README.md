@@ -1,6 +1,6 @@
 # Multi-Arch EDR Hook Detector
 
-A focused tool to detect in-memory EDR hooks on Linux by comparing in-memory library function bytes with the clean on-disk bytes and applying architecture-specific heuristics. Supports both **ARM64 (AArch64)** and **x86 / x86-64** targets.
+A focused tool to detect in-memory EDR hooks on Linux by comparing in-memory library function bytes with the clean on-disk bytes and applying architecture-specific heuristics. Supports both **ARM64 (AArch64)** and **x86 / x86-64** targets. Also enumerates loaded **eBPF programs** system-wide and flags hook-capable types.
 
 This repository contains a compact C program that inspects running processes, locates loaded libraries (libc and other common libraries), reads a short window of instructions from both the on-disk library and the process memory, and attempts to detect suspicious in-memory replacements/trampolines while avoiding known benign patterns.
 
@@ -10,15 +10,17 @@ This repository contains a compact C program that inspects running processes, lo
 - Compares on-disk and in-memory instruction sequences for candidate functions
 - Filters common benign cases: syscall_cp stubs, PLT/GOT stubs, thin wrappers, tail-call optimisations, and IFUNC alternative implementations
 - x86 includes a lightweight variable-length instruction decoder covering syscall instructions (SYSCALL, INT 0x80, SYSENTER), direct/indirect branches, and NOP sequences
+- **eBPF enumeration**: enumerates all loaded eBPF programs via the `bpf()` syscall and flags hook-capable types (KPROBE, TRACING, LSM, TRACEPOINT, PERF_EVENT, SYSCALL)
 - CLI options to scan a single PID or restrict to a library path/name
 - JSON output mode
 - Small, zero-dependency C program; compiles with a standard GCC toolchain
 
 ## Limitations
 
-- Scope: Userland-only detection; kernel hooks (eBPF, kprobes, kernel modules) are out of scope.
-- Permissions: Root is required to read other processes' `/proc/[pid]/mem`.
+- Permissions: Root is required to read other processes' `/proc/[pid]/mem` and to enumerate eBPF programs.
 - The x86 instruction decoder is intentionally minimal — it handles the common function-prologue patterns needed for hook detection, not every opcode.
+- eBPF detection is **presence-based**, not behavioural: hook-capable program types are flagged, but a loaded KPROBE or TRACING program is not necessarily malicious. Legitimate security tools (perf, bpftrace, Falco, etc.) use the same types.
+- A kernel-level attacker with rootkit access can patch the BPF subsystem to hide programs from `bpf()` enumeration.
 
 ## Quickstart (build & run)
 
@@ -53,11 +55,37 @@ sudo ./edr_hooks_check --pid 1234 --verbose
 
 ## Detection overview
 
+### Userspace in-memory hooks
+
 - The program reads a window of bytes from the on-disk ELF for each monitored function and from the target process memory.
 - **ARM64**: reads 8 fixed-width 32-bit instructions (32 bytes). Detects SVC removal, suspicious B/BL/BR additions, and checks several benign trampoline patterns.
 - **x86/x86-64**: reads 64 bytes (enough for ~10–15 variable-length instructions). A lightweight decoder identifies syscall instructions (SYSCALL / INT 0x80 / SYSENTER), direct jumps (JMP rel8/rel32, CALL rel32), indirect branches (JMP r/m, CALL r/m), NOPs, and RET. The same disk-vs-memory scoring logic is then applied.
 - Architecture is determined from the ELF `e_machine` field of each library at scan time, so a single scanner binary handles mixed environments.
 - A function is considered suspicious when the disk and in-memory sequences differ, and the in-memory version lacks a syscall instruction that is present on disk — a pattern that strongly indicates in-memory replacement.
+
+### eBPF program enumeration
+
+The eBPF scan runs system-wide (not per-process) and uses the `bpf()` syscall directly — no external tools required.
+
+1. `BPF_PROG_GET_NEXT_ID` loops until `ENOENT` to collect all loaded program IDs.
+2. `BPF_PROG_GET_FD_BY_ID` opens a file descriptor for each program.
+3. `BPF_OBJ_GET_INFO_BY_FD` retrieves the `bpf_prog_info` struct: program type, name, and the UID that loaded it.
+
+Programs are classified into **hook-capable** (types that can intercept kernel execution) and **non-hook-capable**:
+
+| Type | Hook-capable | Common use |
+|---|---|---|
+| `KPROBE` | yes | dynamic kernel instrumentation |
+| `TRACING` | yes | fentry/fexit/fmod_ret kernel hooks |
+| `LSM` | yes | Linux Security Module callbacks |
+| `TRACEPOINT` | yes | static kernel tracepoints |
+| `RAW_TRACEPOINT` | yes | lower-overhead tracepoints |
+| `RAW_TRACEPOINT_WRITABLE` | yes | writable raw tracepoints |
+| `PERF_EVENT` | yes | perf-based instrumentation |
+| `SYSCALL` | yes | syscall-level programs |
+| `XDP` / `SOCKET_FILTER` / `SCHED_CLS` | no | networking only |
+
+In default mode only hook-capable programs are printed. Pass `-v` to see all loaded programs.
 
 ## Source layout
 
@@ -67,6 +95,7 @@ sudo ./edr_hooks_check --pid 1234 --verbose
 | `common.c` | ELF parsing (ELF32 + ELF64), process scanning, output, arch dispatch |
 | `arch_arm64.h/c` | ARM64 opcode constants and `detect_hook_confidence_arm64()` |
 | `arch_x86.h/c` | x86 instruction decoder and `detect_hook_confidence_x86()` |
+| `kernel_ebpf.h/c` | eBPF program enumeration via `bpf()` syscall |
 | `main.c` | CLI argument parsing and main scan loop |
 
 ## Output
@@ -79,6 +108,12 @@ Example (trimmed):
 ========================================================
 
 [+] No /etc/ld.so.preload
+
+[*] Scanning eBPF programs...
+  [KPROBE                      ] id=42    name=sys_enter_open  uid=0   [hook-capable]
+  [TRACING                     ] id=51    name=<unnamed>       uid=0   [hook-capable]
+    3 program(s) found, 2 hook-capable
+    Run with -v to see non-hook-capable programs
 
 Scanning processes...
 

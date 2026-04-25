@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "common.h"
+#include "kernel_ebpf.h"
 
 static void print_usage(const char *prog_name) {
     printf("Multi-Arch EDR Hook Detector (ARM64 + x86/x86-64)\n");
@@ -70,6 +71,10 @@ int main(int argc, char *argv[]) {
     }
 
     check_environment_hooks(&config);
+
+    if (!config.json_output) printf("\n");
+    scan_ebpf_programs(&config);
+    if (!config.json_output) printf("\n");
 
     int total = 0, hooked = 0, total_hooks = 0;
 

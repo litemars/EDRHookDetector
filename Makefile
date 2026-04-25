@@ -10,7 +10,7 @@ LIBS    := -ldl
 
 TARGET := edr_hooks_check
 
-SRCS := main.c common.c arch_arm64.c arch_x86.c
+SRCS := main.c common.c arch_arm64.c arch_x86.c kernel_ebpf.c
 OBJS := $(SRCS:.c=.o)
 
 .PHONY: all static clean run

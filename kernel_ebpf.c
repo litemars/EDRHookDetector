@@ -3,16 +3,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/bpf.h>
 
 #include "kernel_ebpf.h"
 
-/*
- * Fallback definitions for program types added in kernels 5.3–5.14.
- * These are stable ABI values — the numbers never change once assigned.
- */
 #ifndef BPF_PROG_TYPE_TRACING
 #define BPF_PROG_TYPE_TRACING           26
 #endif
@@ -31,56 +28,148 @@
 #ifndef BPF_PROG_TYPE_SYSCALL
 #define BPF_PROG_TYPE_SYSCALL           31
 #endif
+#ifndef BPF_BTF_GET_FD_BY_ID
+#define BPF_BTF_GET_FD_BY_ID            19
+#endif
 
 static int bpf_call(int cmd, union bpf_attr *attr, unsigned int size) {
     return (int)syscall(__NR_bpf, cmd, attr, size);
 }
 
-static const char *prog_type_str(uint32_t type) {
-    switch ((int)type) {
-        case BPF_PROG_TYPE_UNSPEC:                  return "UNSPEC";
-        case BPF_PROG_TYPE_SOCKET_FILTER:           return "SOCKET_FILTER";
-        case BPF_PROG_TYPE_KPROBE:                  return "KPROBE";
-        case BPF_PROG_TYPE_SCHED_CLS:               return "SCHED_CLS";
-        case BPF_PROG_TYPE_SCHED_ACT:               return "SCHED_ACT";
-        case BPF_PROG_TYPE_TRACEPOINT:              return "TRACEPOINT";
-        case BPF_PROG_TYPE_XDP:                     return "XDP";
-        case BPF_PROG_TYPE_PERF_EVENT:              return "PERF_EVENT";
-        case BPF_PROG_TYPE_CGROUP_SKB:              return "CGROUP_SKB";
-        case BPF_PROG_TYPE_CGROUP_SOCK:             return "CGROUP_SOCK";
-        case BPF_PROG_TYPE_LWT_IN:                  return "LWT_IN";
-        case BPF_PROG_TYPE_LWT_OUT:                 return "LWT_OUT";
-        case BPF_PROG_TYPE_LWT_XMIT:               return "LWT_XMIT";
-        case BPF_PROG_TYPE_SOCK_OPS:                return "SOCK_OPS";
-        case BPF_PROG_TYPE_SK_SKB:                  return "SK_SKB";
-        case BPF_PROG_TYPE_CGROUP_DEVICE:           return "CGROUP_DEVICE";
-        case BPF_PROG_TYPE_SK_MSG:                  return "SK_MSG";
-        case BPF_PROG_TYPE_RAW_TRACEPOINT:          return "RAW_TRACEPOINT";
-        case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:        return "CGROUP_SOCK_ADDR";
-        case BPF_PROG_TYPE_LWT_SEG6LOCAL:           return "LWT_SEG6LOCAL";
-        case BPF_PROG_TYPE_LIRC_MODE2:              return "LIRC_MODE2";
-        case BPF_PROG_TYPE_SK_REUSEPORT:            return "SK_REUSEPORT";
-        case BPF_PROG_TYPE_FLOW_DISSECTOR:          return "FLOW_DISSECTOR";
-        case BPF_PROG_TYPE_CGROUP_SYSCTL:           return "CGROUP_SYSCTL";
-        case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: return "RAW_TRACEPOINT_WRITABLE";
-        case BPF_PROG_TYPE_CGROUP_SOCKOPT:          return "CGROUP_SOCKOPT";
-        case BPF_PROG_TYPE_TRACING:                 return "TRACING";
-        case BPF_PROG_TYPE_STRUCT_OPS:              return "STRUCT_OPS";
-        case BPF_PROG_TYPE_EXT:                     return "EXT";
-        case BPF_PROG_TYPE_LSM:                     return "LSM";
-        case BPF_PROG_TYPE_SK_LOOKUP:               return "SK_LOOKUP";
-        case BPF_PROG_TYPE_SYSCALL:                 return "SYSCALL";
-        default:                                     return "UNKNOWN";
+/* ── BTF name resolution ─────────────────────────────────────────────────── */
+
+#define BTF_MAGIC_VAL 0xeb9fu
+
+struct btf_hdr {
+    uint16_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint32_t hdr_len;
+    uint32_t type_off;
+    uint32_t type_len;
+    uint32_t str_off;
+    uint32_t str_len;
+};
+
+struct btf_typ {
+    uint32_t name_off;
+    uint32_t info;
+    uint32_t size_or_type;
+};
+
+/* bpf_btf_info is not in older kernel headers */
+struct btf_obj_info {
+    uint64_t btf;
+    uint32_t btf_size;
+    uint32_t id;
+    uint64_t name;
+    uint32_t name_len;
+    uint32_t kernel_btf;
+};
+
+static uint8_t       *g_btf_data = NULL;
+static const uint8_t *g_type_sec = NULL;
+static uint32_t       g_type_len = 0;
+static const char    *g_str_sec  = NULL;
+static uint32_t       g_str_len  = 0;
+
+static uint32_t btf_extra(uint32_t kind, uint32_t vlen) {
+    switch (kind) {
+        case 1:  return 4;            /* INT */
+        case 3:  return 12;           /* ARRAY */
+        case 4:
+        case 5:  return vlen * 12u;   /* STRUCT, UNION */
+        case 6:  return vlen * 8u;    /* ENUM */
+        case 13: return vlen * 8u;    /* FUNC_PROTO */
+        case 14: return 4;            /* VAR */
+        case 15: return vlen * 12u;   /* DATASEC */
+        case 17: return 4;            /* DECL_TAG */
+        case 19: return vlen * 12u;   /* ENUM64 */
+        case 0: case 2: case 7: case 8: case 9: case 10: case 11:
+        case 12: case 16: case 18:    return 0;
+        default: return UINT32_MAX;   /* unknown kind — stop iteration */
     }
 }
 
-/*
- * Returns 1 for program types that can intercept kernel execution paths:
- * tracing hooks (fentry/fexit/fmod_ret), kprobes, LSM callbacks,
- * tracepoints, perf events, and the general SYSCALL type.
- * These are the types an EDR would load; legitimate system software
- * uses them too, so presence alone is not proof of malice.
- */
+static void load_kernel_btf(void) {
+    if (g_btf_data) return;
+
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.start_id = 1u;   /* kernel vmlinux BTF always has ID=1 */
+    int fd = bpf_call(BPF_BTF_GET_FD_BY_ID, &attr, sizeof(attr));
+    if (fd < 0) return;
+
+    struct btf_obj_info info;
+    memset(&info, 0, sizeof(info));
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd   = (uint32_t)fd;
+    attr.info.info_len = (uint32_t)sizeof(info);
+    attr.info.info     = (uint64_t)(uintptr_t)&info;
+    if (bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) < 0) {
+        close(fd); return;
+    }
+
+    uint32_t sz = info.btf_size;
+    if (sz == 0 || sz > 64u * 1024u * 1024u) { close(fd); return; }
+
+    uint8_t *buf = malloc(sz);
+    if (!buf) { close(fd); return; }
+
+    memset(&info, 0, sizeof(info));
+    info.btf      = (uint64_t)(uintptr_t)buf;
+    info.btf_size = sz;
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd   = (uint32_t)fd;
+    attr.info.info_len = (uint32_t)sizeof(info);
+    attr.info.info     = (uint64_t)(uintptr_t)&info;
+    int rc = bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
+    close(fd);
+    if (rc < 0) { free(buf); return; }
+
+    struct btf_hdr *hdr = (struct btf_hdr *)buf;
+    if (sz < sizeof(*hdr) || hdr->magic != BTF_MAGIC_VAL) { free(buf); return; }
+
+    uint32_t ts = hdr->hdr_len + hdr->type_off;
+    uint32_t ss = hdr->hdr_len + hdr->str_off;
+    if (ts + hdr->type_len > sz || ss + hdr->str_len > sz) { free(buf); return; }
+
+    g_btf_data = buf;
+    g_type_sec = buf + ts;
+    g_type_len = hdr->type_len;
+    g_str_sec  = (const char *)(buf + ss);
+    g_str_len  = hdr->str_len;
+}
+
+static const char *btf_resolve(uint32_t type_id) {
+    if (!type_id || !g_btf_data) return NULL;
+
+    const uint8_t *p   = g_type_sec;
+    const uint8_t *end = p + g_type_len;
+    uint32_t       id  = 0;
+
+    while (p + sizeof(struct btf_typ) <= end) {
+        id++;
+        const struct btf_typ *t = (const struct btf_typ *)p;
+        uint32_t kind  = (t->info >> 24) & 0x1fu;
+        uint32_t vlen  = t->info & 0xffffu;
+        uint32_t extra = btf_extra(kind, vlen);
+
+        if (extra == UINT32_MAX) break;
+
+        if (id == type_id) {
+            if (t->name_off < g_str_len && g_str_sec[t->name_off])
+                return g_str_sec + t->name_off;
+            return NULL;
+        }
+
+        p += sizeof(struct btf_typ) + extra;
+    }
+    return NULL;
+}
+
+/* ── Hook classification ─────────────────────────────────────────────────── */
+
 static int is_hook_capable(uint32_t type) {
     switch ((int)type) {
         case BPF_PROG_TYPE_KPROBE:
@@ -97,14 +186,31 @@ static int is_hook_capable(uint32_t type) {
     }
 }
 
+static const char *prog_type_str(uint32_t type) {
+    switch ((int)type) {
+        case BPF_PROG_TYPE_KPROBE:                  return "KPROBE";
+        case BPF_PROG_TYPE_TRACEPOINT:              return "TRACEPOINT";
+        case BPF_PROG_TYPE_PERF_EVENT:              return "PERF_EVENT";
+        case BPF_PROG_TYPE_RAW_TRACEPOINT:          return "RAW_TRACEPOINT";
+        case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE: return "RAW_TP_WRITABLE";
+        case BPF_PROG_TYPE_TRACING:                 return "TRACING";
+        case BPF_PROG_TYPE_LSM:                     return "LSM";
+        case BPF_PROG_TYPE_SYSCALL:                 return "SYSCALL";
+        default:                                    return "UNKNOWN";
+    }
+}
+
+/* ── Main scan ───────────────────────────────────────────────────────────── */
+
 void scan_ebpf_programs(const Config *config) {
     if (!config->json_output)
-        printf("[*] Scanning eBPF programs...\n");
+        printf("[*] Scanning eBPF kernel hooks...\n");
     else
-        printf("{\"ebpf_programs\":[");
+        printf("{\"ebpf_hooks\":[");
+
+    load_kernel_btf();
 
     uint32_t id      = 0;
-    int      total   = 0;
     int      n_hooks = 0;
     int      printed = 0;
 
@@ -117,17 +223,13 @@ void scan_ebpf_programs(const Config *config) {
         if (ret < 0) {
             if (errno == ENOENT) break;
             if (errno == EPERM || errno == EACCES) {
-                if (config->json_output)
-                    printf("]}\n");
-                else
-                    fprintf(stderr, "[!] eBPF enumeration requires root\n");
+                if (config->json_output) printf("]}\n");
+                else fprintf(stderr, "[!] eBPF enumeration requires root\n");
                 return;
             }
             if (errno == ENOSYS) {
-                if (config->json_output)
-                    printf("]}\n");
-                else
-                    fprintf(stderr, "[!] bpf() syscall unavailable — kernel too old or eBPF disabled\n");
+                if (config->json_output) printf("]}\n");
+                else fprintf(stderr, "[!] bpf() syscall not available\n");
                 return;
             }
             break;
@@ -145,52 +247,50 @@ void scan_ebpf_programs(const Config *config) {
         attr.info.bpf_fd   = (uint32_t)fd;
         attr.info.info_len = (uint32_t)sizeof(info);
         attr.info.info     = (uint64_t)(uintptr_t)&info;
-
         ret = bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
         close(fd);
         if (ret < 0) continue;
 
-        total++;
-        int hook = is_hook_capable(info.type);
-        if (hook) n_hooks++;
+        if (!is_hook_capable(info.type)) continue;
+        n_hooks++;
 
-        if (!config->verbose && !hook && !config->json_output) continue;
+        /* Resolve the attached kernel function name via BTF (kernel 5.5+) */
+        const char *fn_name = btf_resolve(info.attach_btf_id);
 
-        char name_buf[BPF_OBJ_NAME_LEN + 1];
-        memcpy(name_buf, info.name, BPF_OBJ_NAME_LEN);
-        name_buf[BPF_OBJ_NAME_LEN] = '\0';
+        char prog_name[BPF_OBJ_NAME_LEN + 1];
+        memcpy(prog_name, info.name, BPF_OBJ_NAME_LEN);
+        prog_name[BPF_OBJ_NAME_LEN] = '\0';
 
         if (config->json_output) {
             if (printed > 0) printf(",");
-            printf("{\"id\":%u,\"type\":\"%s\",\"name\":\"%s\",\"uid\":%u,\"hook_capable\":%s}",
-                   info.id,
+            printf("{\"kernel_function\":\"%s\",\"prog_type\":\"%s\",\"prog_name\":\"%s\",\"uid\":%u}",
+                   fn_name ? fn_name : "",
                    prog_type_str(info.type),
-                   name_buf[0] ? name_buf : "",
-                   info.created_by_uid,
-                   hook ? "true" : "false");
+                   prog_name,
+                   info.created_by_uid);
         } else {
-            printf("  [%-28s] id=%-5u name=%-16s uid=%u%s\n",
-                   prog_type_str(info.type),
-                   info.id,
-                   name_buf[0] ? name_buf : "<unnamed>",
-                   info.created_by_uid,
-                   hook ? "  [hook-capable]" : "");
+            if (fn_name)
+                printf("  %-32s [%s]\n", fn_name, prog_type_str(info.type));
+            else
+                printf("  %-32s [%s]%s\n",
+                       prog_name[0] ? prog_name : "<unnamed>",
+                       prog_type_str(info.type),
+                       info.attach_btf_id ? " (btf unresolved)" : "");
         }
         printed++;
     }
 
     if (config->json_output) {
         printf("]}\n");
-        return;
-    }
-
-    if (total == 0) {
-        printf("[+] No eBPF programs loaded\n");
     } else {
-        printf("    %d program(s) found, %d hook-capable\n", total, n_hooks);
         if (n_hooks == 0)
             printf("[+] No hook-capable eBPF programs\n");
-        if (!config->verbose && total > n_hooks)
-            printf("    Run with -v to see non-hook-capable programs\n");
+        else
+            printf("    %d kernel hook(s) found\n", n_hooks);
+    }
+
+    if (g_btf_data) {
+        free(g_btf_data);
+        g_btf_data = NULL;
     }
 }

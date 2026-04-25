@@ -63,29 +63,26 @@ sudo ./edr_hooks_check --pid 1234 --verbose
 - Architecture is determined from the ELF `e_machine` field of each library at scan time, so a single scanner binary handles mixed environments.
 - A function is considered suspicious when the disk and in-memory sequences differ, and the in-memory version lacks a syscall instruction that is present on disk — a pattern that strongly indicates in-memory replacement.
 
-### eBPF program enumeration
+### eBPF kernel hook detection
 
-The eBPF scan runs system-wide (not per-process) and uses the `bpf()` syscall directly — no external tools required.
+The eBPF scan runs system-wide (not per-process) and uses the `bpf()` syscall directly — no external tools required. Only **hook-capable** program types are reported; networking-only types (XDP, SOCKET_FILTER, SCHED_CLS, …) are ignored entirely.
 
 1. `BPF_PROG_GET_NEXT_ID` loops until `ENOENT` to collect all loaded program IDs.
 2. `BPF_PROG_GET_FD_BY_ID` opens a file descriptor for each program.
-3. `BPF_OBJ_GET_INFO_BY_FD` retrieves the `bpf_prog_info` struct: program type, name, and the UID that loaded it.
+3. `BPF_OBJ_GET_INFO_BY_FD` retrieves `bpf_prog_info`: type, name, UID, and `attach_btf_id`.
+4. For programs that carry an `attach_btf_id` (TRACING, LSM — kernel 5.5+), the kernel vmlinux BTF (ID=1) is opened and the type section is parsed to resolve the BTF type ID to the exact kernel function name being hooked.
 
-Programs are classified into **hook-capable** (types that can intercept kernel execution) and **non-hook-capable**:
+Hook-capable types reported:
 
-| Type | Hook-capable | Common use |
-|---|---|---|
-| `KPROBE` | yes | dynamic kernel instrumentation |
-| `TRACING` | yes | fentry/fexit/fmod_ret kernel hooks |
-| `LSM` | yes | Linux Security Module callbacks |
-| `TRACEPOINT` | yes | static kernel tracepoints |
-| `RAW_TRACEPOINT` | yes | lower-overhead tracepoints |
-| `RAW_TRACEPOINT_WRITABLE` | yes | writable raw tracepoints |
-| `PERF_EVENT` | yes | perf-based instrumentation |
-| `SYSCALL` | yes | syscall-level programs |
-| `XDP` / `SOCKET_FILTER` / `SCHED_CLS` | no | networking only |
-
-In default mode only hook-capable programs are printed. Pass `-v` to see all loaded programs.
+| Type | Common use |
+|---|---|
+| `KPROBE` | dynamic kernel instrumentation |
+| `TRACING` | fentry/fexit/fmod_ret kernel hooks |
+| `LSM` | Linux Security Module callbacks |
+| `TRACEPOINT` | static kernel tracepoints |
+| `RAW_TRACEPOINT` / `RAW_TP_WRITABLE` | lower-overhead tracepoints |
+| `PERF_EVENT` | perf-based instrumentation |
+| `SYSCALL` | syscall-level programs |
 
 ## Source layout
 
@@ -109,11 +106,11 @@ Example (trimmed):
 
 [+] No /etc/ld.so.preload
 
-[*] Scanning eBPF programs...
-  [KPROBE                      ] id=42    name=sys_enter_open  uid=0   [hook-capable]
-  [TRACING                     ] id=51    name=<unnamed>       uid=0   [hook-capable]
-    3 program(s) found, 2 hook-capable
-    Run with -v to see non-hook-capable programs
+[*] Scanning eBPF kernel hooks...
+  security_file_open               [TRACING]
+  do_unlinkat                      [TRACING]
+  sys_enter_open                   [KPROBE]
+    3 kernel hook(s) found
 
 Scanning processes...
 

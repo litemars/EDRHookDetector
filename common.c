@@ -323,7 +323,7 @@ int get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int ve
                             &start, &end, perms, &offset, path);
         if (parsed < 4) continue;
         if (parsed < 5 || path[0] == '\0') continue;
-        if (perms[2] != 'x' || offset != 0 || !strstr(path, ".so")) continue;
+        if (offset != 0 || !strstr(path, ".so")) continue;
         if (strcmp(path, last_path) == 0) continue;
 
         const char *lib_name = strrchr(path, '/');

@@ -93,6 +93,7 @@ static uint32_t btf_extra(uint32_t kind, uint32_t vlen) {
 
 static void load_kernel_btf(void) {
     if (g_btf_data) return;
+    g_btf_partial = 0;
 
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -141,6 +142,8 @@ static void load_kernel_btf(void) {
     g_str_len  = hdr->str_len;
 }
 
+static int g_btf_partial = 0;   /* set if iteration aborted on unknown kind */
+
 static const char *btf_resolve(uint32_t type_id) {
     if (!type_id || !g_btf_data) return NULL;
 
@@ -155,7 +158,14 @@ static const char *btf_resolve(uint32_t type_id) {
         uint32_t vlen  = t->info & 0xffffu;
         uint32_t extra = btf_extra(kind, vlen);
 
-        if (extra == UINT32_MAX) break;
+        if (extra == UINT32_MAX) {
+            /* Unknown BTF kind (newer kernel). We can't compute the size of
+             * this entry, so we cannot reliably advance past it. Mark BTF
+             * resolution as partial and stop — but only the FIRST time, so
+             * subsequent calls don't keep re-iterating the prefix. */
+            g_btf_partial = 1;
+            break;
+        }
 
         if (id == type_id) {
             if (t->name_off < g_str_len && g_str_sec[t->name_off])
@@ -202,7 +212,7 @@ static const char *prog_type_str(uint32_t type) {
 
 /* ── Main scan ───────────────────────────────────────────────────────────── */
 
-void scan_ebpf_programs(const Config *config) {
+int scan_ebpf_programs(const Config *config) {
     if (!config->json_output)
         printf("[*] Scanning eBPF kernel hooks...\n");
     else
@@ -210,9 +220,11 @@ void scan_ebpf_programs(const Config *config) {
 
     load_kernel_btf();
 
-    uint32_t id      = 0;
-    int      n_hooks = 0;
-    int      printed = 0;
+    uint32_t id          = 0;
+    int      n_hooks     = 0;
+    int      printed     = 0;
+    int      n_seen      = 0;     /* total programs the kernel listed */
+    int      n_skipped   = 0;     /* programs we couldn't query */
 
     for (;;) {
         union bpf_attr attr;
@@ -225,21 +237,31 @@ void scan_ebpf_programs(const Config *config) {
             if (errno == EPERM || errno == EACCES) {
                 if (config->json_output) printf("]}\n");
                 else fprintf(stderr, "[!] eBPF enumeration requires root\n");
-                return;
+                return 0;
             }
             if (errno == ENOSYS) {
                 if (config->json_output) printf("]}\n");
                 else fprintf(stderr, "[!] bpf() syscall not available\n");
-                return;
+                return 0;
             }
+            if (!config->json_output)
+                fprintf(stderr, "[!] BPF_PROG_GET_NEXT_ID failed: %s (id=%u, stopping)\n",
+                        strerror(errno), id);
             break;
         }
         id = attr.next_id;
+        n_seen++;
 
         memset(&attr, 0, sizeof(attr));
         attr.start_id = id;
         int fd = bpf_call(BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr));
-        if (fd < 0) continue;
+        if (fd < 0) {
+            n_skipped++;
+            if (config->verbose && !config->json_output)
+                fprintf(stderr, "[!] PROG_GET_FD_BY_ID(id=%u) failed: %s\n",
+                        id, strerror(errno));
+            continue;
+        }
 
         struct bpf_prog_info info;
         memset(&info, 0, sizeof(info));
@@ -249,7 +271,13 @@ void scan_ebpf_programs(const Config *config) {
         attr.info.info     = (uint64_t)(uintptr_t)&info;
         ret = bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
         close(fd);
-        if (ret < 0) continue;
+        if (ret < 0) {
+            n_skipped++;
+            if (config->verbose && !config->json_output)
+                fprintf(stderr, "[!] OBJ_GET_INFO_BY_FD(id=%u) failed: %s\n",
+                        id, strerror(errno));
+            continue;
+        }
 
         if (!is_hook_capable(info.type)) continue;
         n_hooks++;
@@ -270,9 +298,11 @@ void scan_ebpf_programs(const Config *config) {
                    info.created_by_uid);
         } else {
             if (fn_name)
-                printf("  %-32s [%s]\n", fn_name, prog_type_str(info.type));
+                printf("  %-32s [%-16s] prog=%s\n",
+                       fn_name, prog_type_str(info.type),
+                       prog_name[0] ? prog_name : "<unnamed>");
             else
-                printf("  %-32s [%s]%s\n",
+                printf("  %-32s [%-16s]%s\n",
                        prog_name[0] ? prog_name : "<unnamed>",
                        prog_type_str(info.type),
                        info.attach_btf_id ? " (btf unresolved)" : "");
@@ -284,13 +314,29 @@ void scan_ebpf_programs(const Config *config) {
         printf("]}\n");
     } else {
         if (n_hooks == 0)
-            printf("[+] No hook-capable eBPF programs\n");
+            printf("[+] No hook-capable eBPF programs (%d total seen)\n", n_seen);
         else
-            printf("    %d kernel hook(s) found\n", n_hooks);
+            printf("    %d kernel hook(s) found  (out of %d eBPF program(s) seen", n_hooks, n_seen);
+        if (!n_hooks && n_skipped == 0) {
+            /* nothing extra */
+        } else if (n_hooks) {
+            if (n_skipped > 0)
+                printf(", %d skipped - rerun with -v for details", n_skipped);
+            printf(")\n");
+        }
+        if (n_skipped > 0 && n_hooks == 0)
+            printf("[!] %d program(s) could not be queried (rerun with -v for details)\n",
+                   n_skipped);
     }
+
+    if (!config->json_output && g_btf_partial)
+        fprintf(stderr, "[!] BTF resolution partial: kernel uses a BTF kind this build doesn't know;"
+                       " some kernel function names may be missing\n");
 
     if (g_btf_data) {
         free(g_btf_data);
         g_btf_data = NULL;
     }
+
+    return n_hooks;
 }

@@ -88,12 +88,12 @@ Hook-capable types reported:
 
 | File | Contents |
 |---|---|
-| `common.h` | Shared types, constants, and function declarations |
-| `common.c` | ELF parsing (ELF32 + ELF64), process scanning, output, arch dispatch |
-| `arch_arm64.h/c` | ARM64 opcode constants and `detect_hook_confidence_arm64()` |
-| `arch_x86.h/c` | x86 instruction decoder and `detect_hook_confidence_x86()` |
-| `kernel_ebpf.h/c` | eBPF program enumeration via `bpf()` syscall |
-| `main.c` | CLI argument parsing and main scan loop |
+| `src/main.c` | CLI argument parsing and main scan loop |
+| `src/common.h` | Shared types, constants, and function declarations |
+| `src/common.c` | ELF parsing (ELF32 + ELF64), process scanning, output, arch dispatch |
+| `src/arch/arch_arm64.h/c` | ARM64 opcode constants and `detect_hook_confidence_arm64()` |
+| `src/arch/arch_x86.h/c` | x86 instruction decoder and `detect_hook_confidence_x86()` |
+| `src/ebpf/kernel_ebpf.h/c` | eBPF program enumeration via `bpf()` syscall |
 
 ## Output
 

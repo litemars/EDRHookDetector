@@ -73,7 +73,8 @@ int main(int argc, char *argv[]) {
     check_environment_hooks(&config);
 
     if (!config.json_output) printf("\n");
-    scan_ebpf_programs(&config);
+    int ebpf_hooks = scan_ebpf_programs(&config);
+    if (ebpf_hooks < 0) ebpf_hooks = 0;
     if (!config.json_output) printf("\n");
 
     int total = 0, hooked = 0, total_hooks = 0;
@@ -130,22 +131,25 @@ int main(int argc, char *argv[]) {
     }
 
     if (!config.json_output) {
+        int grand_total = total_hooks + ebpf_hooks;
         printf("\n========================================================\n");
         printf("SUMMARY\n");
         printf("========================================================\n");
         printf("Processes scanned:    %d\n", total);
-        printf("With hooks:           %d\n", hooked);
-        printf("Total hooks:          %d\n", total_hooks);
+        printf("Processes w/ hooks:   %d\n", hooked);
+        printf("Userspace hooks:      %d\n", total_hooks);
+        printf("eBPF kernel hooks:    %d\n", ebpf_hooks);
+        printf("Total hooks:          %d\n", grand_total);
 
-        if (hooked == 0) {
+        if (grand_total == 0) {
             printf("\n[+] No EDR hooks detected!\n");
         } else {
             printf("\n[!] EDR hooks found!\n");
-            if (!config.verbose)   printf("    Run with -v for details\n");
+            if (!config.verbose)      printf("    Run with -v for details\n");
             if (!config.show_hexdump) printf("    Run with -x to see instruction hexdumps\n");
         }
         printf("========================================================\n");
     }
 
-    return (hooked > 0) ? 1 : 0;
+    return ((hooked > 0) || (ebpf_hooks > 0)) ? 1 : 0;
 }

@@ -1,26 +1,30 @@
-CC := gcc
+CC     := gcc
 
 CFLAGS := -O2 -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 CFLAGS += -Wshadow -Wconversion -Wno-sign-conversion
 CFLAGS += -fstack-protector-strong
-CFLAGS += -D_FORTIFY_SOURCE=2 -ldl
+CFLAGS += -D_FORTIFY_SOURCE=2
+CFLAGS += -Isrc -Isrc/arch -Isrc/ebpf
 
 LDFLAGS :=
+LIBS    := -ldl
 
-TARGET := arm64_edr_hooks_check
+TARGET := edr_hooks_check
 
-SRCS := arm64_edr_hooks_check.c
-
+SRCS := src/main.c src/common.c \
+        src/arch/arch_arm64.c src/arch/arch_x86.c \
+        src/ebpf/kernel_ebpf.c
 OBJS := $(SRCS:.c=.o)
 
-# Default target
 .PHONY: all static clean run
 
 all: $(TARGET)
 
-# Main binary
-$(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Static build (for portability)
 static: LDFLAGS += -static
@@ -43,7 +47,5 @@ ifndef PID
 endif
 	./$(TARGET) --pid $(PID) -v
 
-
 clean:
-	rm -f $(TARGET)
-
+	rm -f $(TARGET) $(OBJS)

@@ -67,11 +67,12 @@ struct btf_obj_info {
     uint32_t kernel_btf;
 };
 
-static uint8_t       *g_btf_data = NULL;
-static const uint8_t *g_type_sec = NULL;
-static uint32_t       g_type_len = 0;
-static const char    *g_str_sec  = NULL;
-static uint32_t       g_str_len  = 0;
+static uint8_t       *g_btf_data    = NULL;
+static const uint8_t *g_type_sec    = NULL;
+static uint32_t       g_type_len    = 0;
+static const char    *g_str_sec     = NULL;
+static uint32_t       g_str_len     = 0;
+static int            g_btf_partial = 0;   /* set if iteration aborted on unknown kind */
 
 static uint32_t btf_extra(uint32_t kind, uint32_t vlen) {
     switch (kind) {
@@ -142,8 +143,6 @@ static void load_kernel_btf(void) {
     g_str_len  = hdr->str_len;
 }
 
-static int g_btf_partial = 0;   /* set if iteration aborted on unknown kind */
-
 static const char *btf_resolve(uint32_t type_id) {
     if (!type_id || !g_btf_data) return NULL;
 
@@ -209,8 +208,6 @@ static const char *prog_type_str(uint32_t type) {
         default:                                    return "UNKNOWN";
     }
 }
-
-/* ── Main scan ───────────────────────────────────────────────────────────── */
 
 int scan_ebpf_programs(const Config *config) {
     if (!config->json_output)

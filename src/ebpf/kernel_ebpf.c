@@ -459,6 +459,8 @@ static const char *prog_type_str(uint32_t type) {
     }
 }
 
+/* ── Main scan ───────────────────────────────────────────────────────────── */
+
 int scan_ebpf_programs(const Config *config) {
     if (!config->json_output)
         printf("[*] Scanning eBPF kernel hooks...\n");
@@ -551,12 +553,14 @@ int scan_ebpf_programs(const Config *config) {
                    info.created_by_uid);
         } else {
             if (fn_name)
-                printf("  %-48s [%-16s]\n",
-                       fn_name, prog_type_str(info.type));
+                printf("  %-48s [%-16s] prog=%s\n",
+                       fn_name, prog_type_str(info.type),
+                       prog_name[0] ? prog_name : "<unnamed>");
             else
-                printf("  %-48s [%-16s]\n",
+                printf("  %-48s [%-16s]%s\n",
                        prog_name[0] ? prog_name : "<unnamed>",
-                       prog_type_str(info.type));
+                       prog_type_str(info.type),
+                       info.attach_btf_id ? " (btf unresolved)" : "");
         }
         printed++;
     }

@@ -411,6 +411,26 @@ const char *confidence_str(HookConfidence conf) {
     }
 }
 
+void json_print_escaped(const char *s) {
+    if (!s) return;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+            case '"':  fputs("\\\"", stdout); break;
+            case '\\': fputs("\\\\", stdout); break;
+            case '\b': fputs("\\b",  stdout); break;
+            case '\f': fputs("\\f",  stdout); break;
+            case '\n': fputs("\\n",  stdout); break;
+            case '\r': fputs("\\r",  stdout); break;
+            case '\t': fputs("\\t",  stdout); break;
+            default:
+                if (c < 0x20) printf("\\u%04x", (unsigned int)c);
+                else          putchar((int)c);
+                break;
+        }
+    }
+}
+
 static void print_hexdump_words(const char *label, const uint32_t *insns, int count) {
     printf("    %s: ", label);
     for (int i = 0; i < count; i++) printf("%08x ", insns[i]);
@@ -428,35 +448,51 @@ static void print_hexdump_bytes(const char *label, const uint8_t *bytes, int len
 
 void check_environment_hooks(const Config *config) {
     char *ld_preload = getenv("LD_PRELOAD");
-    if (ld_preload && strlen(ld_preload) > 0) {
-        if (config->json_output)
-            printf("{\"warning\":\"LD_PRELOAD\",\"value\":\"%s\"}\n", ld_preload);
-        else
-            printf("[!] LD_PRELOAD is set: %s\n", ld_preload);
+
+    char preload_content[1024] = {0};
+    size_t preload_len = 0;
+    int has_preload_file = 0;
+    FILE *preload_f = fopen("/etc/ld.so.preload", "r");
+    if (preload_f) {
+        has_preload_file = 1;
+        preload_len = fread(preload_content, 1, sizeof(preload_content) - 1, preload_f);
+        fclose(preload_f);
+        if (preload_len > 0 && preload_content[preload_len - 1] == '\n')
+            preload_content[--preload_len] = '\0';
     }
 
-    FILE *preload = fopen("/etc/ld.so.preload", "r");
-    if (preload) {
-        char content[1024] = {0};
-        size_t len = fread(content, 1, sizeof(content) - 1, preload);
-        fclose(preload);
-        if (len > 0 && content[len - 1] == '\n') content[len - 1] = '\0';
-        if (config->json_output)
-            printf("{\"warning\":\"ld.so.preload\",\"exists\":true,\"content\":\"%s\"}\n",
-                   len > 0 ? content : "");
-        else {
-            printf("[!] /etc/ld.so.preload exists");
-            if (len > 0) printf(": %s", content);
-            printf("\n");
+    if (config->json_output) {
+        printf("\"warnings\":[");
+        int first = 1;
+        if (ld_preload && strlen(ld_preload) > 0) {
+            printf("{\"type\":\"LD_PRELOAD\",\"value\":\"");
+            json_print_escaped(ld_preload);
+            printf("\"}");
+            first = 0;
         }
-    } else if (!config->json_output) {
-        printf("[+] No /etc/ld.so.preload\n");
+        if (has_preload_file) {
+            if (!first) printf(",");
+            printf("{\"type\":\"ld.so.preload\",\"exists\":true,\"content\":\"");
+            if (preload_len > 0) json_print_escaped(preload_content);
+            printf("\"}");
+        }
+        printf("]");
+    } else {
+        if (ld_preload && strlen(ld_preload) > 0)
+            printf("[!] LD_PRELOAD is set: %s\n", ld_preload);
+        if (has_preload_file) {
+            printf("[!] /etc/ld.so.preload exists");
+            if (preload_len > 0) printf(": %s", preload_content);
+            printf("\n");
+        } else {
+            printf("[+] No /etc/ld.so.preload\n");
+        }
     }
 }
 
 /* ── Process scanner ─────────────────────────────────────────────────────── */
 
-int scan_process(pid_t pid, const Config *config) {
+int scan_process(pid_t pid, const Config *config, int *first_json) {
     LibraryInfo *libs = NULL;
     int lib_count = get_loaded_libraries(pid, &libs, MAX_LIBRARIES, config->verbose);
     if (lib_count <= 0) { if (libs) free(libs); return -1; }
@@ -511,19 +547,24 @@ int scan_process(pid_t pid, const Config *config) {
             if (confidence == HOOK_CONFIDENCE_NONE) continue;
 
             if (first_hook) {
-                if (config->json_output)
-                    printf("{\"pid\":%d,\"name\":\"%s\",\"hooks\":[", pid, proc_name);
-                else if (config->verbose)
+                if (config->json_output) {
+                    if (!*first_json) printf(",");
+                    *first_json = 0;
+                    printf("{\"pid\":%d,\"name\":\"", pid);
+                    json_print_escaped(proc_name);
+                    printf("\",\"hooks\":[");
+                } else if (config->verbose)
                     printf("\n[!] PID %d (%s):\n", pid, proc_name);
                 first_hook = 0;
             }
 
             if (config->json_output) {
                 if (total_hooks > 0) printf(",");
-                printf("{\"function\":\"%s\",\"library\":\"%s\",\"confidence\":\"%s\"}",
-                       libs[i].functions[j].name,
-                       libs[i].short_name,
-                       confidence_str(confidence));
+                printf("{\"function\":\"");
+                json_print_escaped(libs[i].functions[j].name);
+                printf("\",\"library\":\"");
+                json_print_escaped(libs[i].short_name);
+                printf("\",\"confidence\":\"%s\"}", confidence_str(confidence));
             } else if (config->verbose) {
                 printf("    [HOOK] %s in %s (confidence: %s)\n",
                        libs[i].functions[j].name,

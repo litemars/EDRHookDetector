@@ -6,8 +6,7 @@ CFLAGS += -fstack-protector-strong
 CFLAGS += -D_FORTIFY_SOURCE=2
 CFLAGS += -Isrc -Isrc/arch -Isrc/ebpf
 
-LDFLAGS :=
-LIBS    := -ldl
+LDFLAGS := -ldl
 
 TARGET := edr_hooks_check
 
@@ -21,7 +20,7 @@ OBJS := $(SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

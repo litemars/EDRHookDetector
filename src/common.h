@@ -15,7 +15,9 @@
 #include <getopt.h>
 #include <errno.h>
 
+#ifndef STT_GNU_IFUNC
 #define STT_GNU_IFUNC    10
+#endif
 #define MAX_PROCESSES    2048
 #define MAX_FUNCTIONS    256
 #define MAX_LIBRARIES    32
@@ -69,9 +71,10 @@ int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, 
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
 int  get_process_name(pid_t pid, char *name, int size);
 void check_environment_hooks(const Config *config);
-int  scan_process(pid_t pid, const Config *config);
+int  scan_process(pid_t pid, const Config *config, int *first_json);
 
 /* Output helpers */
 const char *confidence_str(HookConfidence conf);
+void        json_print_escaped(const char *s);
 
 #endif /* COMMON_H */

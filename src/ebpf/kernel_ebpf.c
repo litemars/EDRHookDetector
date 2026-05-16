@@ -187,16 +187,6 @@ static const char *btf_resolve(uint32_t type_id) {
     return NULL;
 }
 
-/* ── Attach-point resolution via BPF_TASK_FD_QUERY ───────────────────────── */
-/*
- * info.name is capped at BPF_OBJ_NAME_LEN (16 bytes), so program names like
- * "kprobe__tcp_v6_connect" arrive truncated. BCC-style tools attach via the
- * legacy perf_event_open + PERF_EVENT_IOC_SET_BPF path (no BPF link object),
- * so link iteration can't recover names. Instead we walk /proc/<pid>/fd, ask
- * the kernel via BPF_TASK_FD_QUERY about each FD, and build a prog_id → real
- * attach-target map. Works for kprobe/kretprobe/uprobe/uretprobe/tracepoint/
- * raw_tracepoint regardless of how the program was attached.
- */
 
 struct attach_entry {
     uint32_t prog_id;
@@ -463,17 +453,18 @@ int scan_ebpf_programs(const Config *config) {
     if (!config->json_output)
         printf("[*] Scanning eBPF kernel hooks...\n");
     else
-        printf("{\"ebpf_hooks\":[");
+        printf("\"ebpf_hooks\":[");
 
     load_kernel_btf();
     load_task_fd_attaches();
     load_bpf_links();
 
-    uint32_t id          = 0;
-    int      n_hooks     = 0;
-    int      printed     = 0;
-    int      n_seen      = 0;     /* total programs the kernel listed */
-    int      n_skipped   = 0;     /* programs we couldn't query */
+    uint32_t id            = 0;
+    int      n_hooks       = 0;
+    int      printed       = 0;
+    int      n_seen        = 0;     /* total programs the kernel listed */
+    int      n_skipped     = 0;     /* programs we couldn't query */
+    int      print_summary = 1;     /* suppress textual summary on hard abort */
 
     for (;;) {
         union bpf_attr attr;
@@ -484,14 +475,16 @@ int scan_ebpf_programs(const Config *config) {
         if (ret < 0) {
             if (errno == ENOENT) break;
             if (errno == EPERM || errno == EACCES) {
-                if (config->json_output) printf("]}\n");
-                else fprintf(stderr, "[!] eBPF enumeration requires root\n");
-                return 0;
+                if (!config->json_output)
+                    fprintf(stderr, "[!] eBPF enumeration requires root\n");
+                print_summary = 0;
+                break;
             }
             if (errno == ENOSYS) {
-                if (config->json_output) printf("]}\n");
-                else fprintf(stderr, "[!] bpf() syscall not available\n");
-                return 0;
+                if (!config->json_output)
+                    fprintf(stderr, "[!] bpf() syscall not available\n");
+                print_summary = 0;
+                break;
             }
             if (!config->json_output)
                 fprintf(stderr, "[!] BPF_PROG_GET_NEXT_ID failed: %s (id=%u, stopping)\n",
@@ -544,11 +537,11 @@ int scan_ebpf_programs(const Config *config) {
 
         if (config->json_output) {
             if (printed > 0) printf(",");
-            printf("{\"kernel_function\":\"%s\",\"prog_type\":\"%s\",\"prog_name\":\"%s\",\"uid\":%u}",
-                   fn_name ? fn_name : "",
-                   prog_type_str(info.type),
-                   prog_name,
-                   info.created_by_uid);
+            printf("{\"kernel_function\":\"");
+            if (fn_name) json_print_escaped(fn_name);
+            printf("\",\"prog_type\":\"%s\",\"prog_name\":\"", prog_type_str(info.type));
+            json_print_escaped(prog_name);
+            printf("\",\"uid\":%u}", info.created_by_uid);
         } else {
             if (fn_name)
                 printf("  %-48s [%-16s] prog=%s\n",
@@ -564,8 +557,8 @@ int scan_ebpf_programs(const Config *config) {
     }
 
     if (config->json_output) {
-        printf("]}\n");
-    } else {
+        printf("]");
+    } else if (print_summary) {
         if (n_hooks == 0)
             printf("[+] No hook-capable eBPF programs (%d total seen)\n", n_seen);
         else

@@ -70,17 +70,24 @@ int main(int argc, char *argv[]) {
         printf("\n");
     }
 
+    if (config.json_output) printf("{");
+
     check_environment_hooks(&config);
 
-    if (!config.json_output) printf("\n");
+    if (config.json_output) printf(",");
+    else printf("\n");
+
     int ebpf_hooks = scan_ebpf_programs(&config);
     if (ebpf_hooks < 0) ebpf_hooks = 0;
-    if (!config.json_output) printf("\n");
+
+    if (config.json_output) printf(",\"processes\":[");
+    else printf("\n");
 
     int total = 0, hooked = 0, total_hooks = 0;
+    int first_json = 1;
 
     if (config.target_pid != 0) {
-        int hooks = scan_process(config.target_pid, &config);
+        int hooks = scan_process(config.target_pid, &config, &first_json);
         if (hooks > 0) {
             hooked = 1;
             total_hooks = hooks;
@@ -92,29 +99,29 @@ int main(int argc, char *argv[]) {
         }
         total = (hooks >= 0) ? 1 : 0;
     } else {
+        if (!config.json_output)
+            printf("\nScanning processes...\n");
+
         DIR *proc = opendir("/proc");
         if (!proc) {
             fprintf(stderr, "Failed to open /proc: %s\n", strerror(errno));
+            if (config.json_output) printf("]}\n");
             return 1;
         }
 
-        if (!config.json_output)
-            printf("\nScanning processes...\n");
-        else
-            printf("[");
-
-        int first_json = 1;
         struct dirent *entry;
         while ((entry = readdir(proc)) != NULL) {
             if (entry->d_type != DT_DIR) continue;
             if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
 
-            pid_t pid = (pid_t)atoi(entry->d_name);
-            int   hooks = scan_process(pid, &config);
+            char *endp;
+            long val = strtol(entry->d_name, &endp, 10);
+            if (endp == entry->d_name || *endp != '\0' || val <= 0) continue;
+            pid_t pid = (pid_t)val;
+
+            int hooks = scan_process(pid, &config, &first_json);
 
             if (hooks > 0) {
-                if (config.json_output && !first_json) printf(",");
-                first_json = 0;
                 hooked++;
                 total_hooks += hooks;
                 if (!config.verbose && !config.json_output) {
@@ -126,30 +133,31 @@ int main(int argc, char *argv[]) {
             if (hooks >= 0) total++;
         }
         closedir(proc);
-
-        if (config.json_output) printf("]\n");
     }
 
-    if (!config.json_output) {
-        int grand_total = total_hooks + ebpf_hooks;
-        printf("\n========================================================\n");
-        printf("SUMMARY\n");
-        printf("========================================================\n");
-        printf("Processes scanned:    %d\n", total);
-        printf("Processes w/ hooks:   %d\n", hooked);
-        printf("Userspace hooks:      %d\n", total_hooks);
-        printf("eBPF kernel hooks:    %d\n", ebpf_hooks);
-        printf("Total hooks:          %d\n", grand_total);
-
-        if (grand_total == 0) {
-            printf("\n[+] No EDR hooks detected!\n");
-        } else {
-            printf("\n[!] EDR hooks found!\n");
-            if (!config.verbose)      printf("    Run with -v for details\n");
-            if (!config.show_hexdump) printf("    Run with -x to see instruction hexdumps\n");
-        }
-        printf("========================================================\n");
+    if (config.json_output) {
+        printf("]}\n");
+        return ((hooked > 0) || (ebpf_hooks > 0)) ? 1 : 0;
     }
+
+    int grand_total = total_hooks + ebpf_hooks;
+    printf("\n========================================================\n");
+    printf("SUMMARY\n");
+    printf("========================================================\n");
+    printf("Processes scanned:    %d\n", total);
+    printf("Processes w/ hooks:   %d\n", hooked);
+    printf("Userspace hooks:      %d\n", total_hooks);
+    printf("eBPF kernel hooks:    %d\n", ebpf_hooks);
+    printf("Total hooks:          %d\n", grand_total);
+
+    if (grand_total == 0) {
+        printf("\n[+] No EDR hooks detected!\n");
+    } else {
+        printf("\n[!] EDR hooks found!\n");
+        if (!config.verbose)      printf("    Run with -v for details\n");
+        if (!config.show_hexdump) printf("    Run with -x to see instruction hexdumps\n");
+    }
+    printf("========================================================\n");
 
     return ((hooked > 0) || (ebpf_hooks > 0)) ? 1 : 0;
 }

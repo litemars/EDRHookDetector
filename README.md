@@ -1,103 +1,107 @@
-# Multi-Arch EDR Hook Detector
+# Multi-Arch EDR & Rootkit Hook Detector
 
-A focused tool to detect in-memory EDR hooks on Linux by comparing in-memory library function bytes with the clean on-disk bytes and applying architecture-specific heuristics. Supports both **ARM64 (AArch64)** and **x86 / x86-64** targets. Also enumerates loaded **eBPF programs** system-wide and flags hook-capable types.
+A single Linux binary that audits a live system for the seven most common ways
+an EDR product (or a rootkit) can intercept activity:
 
-This repository contains a compact C program that inspects running processes, locates loaded libraries (libc and other common libraries), reads a short window of instructions from both the on-disk library and the process memory, and attempts to detect suspicious in-memory replacements/trampolines while avoiding known benign patterns.
+| Layer | What's checked | Source of truth |
+|---|---|---|
+| Userspace inline patches | A curated set of hot functions in `libc`, `libssl`, `libcrypto`, `libpthread`, `libdl`, `libpam`, `libaudit` | on-disk `.so` bytes vs. `/proc/PID/mem` |
+| Env preload | `LD_PRELOAD`, `/etc/ld.so.preload` | filesystem / environment |
+| eBPF programs | Every hook-capable BPF program (KPROBE / TRACING / LSM / TRACEPOINT / PERF_EVENT / SYSCALL) | `bpf()` syscall, BTF, `BPF_TASK_FD_QUERY`, `BPF_LINK_GET_NEXT_ID` |
+| Non-BPF kprobes | Every kprobe/kretprobe, including those from SystemTap or custom LKMs | `/sys/kernel/debug/kprobes/list` |
+| uprobes | Every uprobe, regardless of attachment method | `tracefs/uprobe_events` |
+| ftrace hooks | Functions hooked via ftrace with a custom trampoline (rootkit ftrace-abuse) + the global `current_tracer` state | `tracefs/enabled_functions`, `tracefs/current_tracer` |
+| Active LSMs | The list and order of loaded LSMs; unknown names get flagged | `/sys/kernel/security/lsm` |
+| Tainted kernel modules | Loaded modules with `O` (out-of-tree), `E` (unsigned), or `F` (force-loaded) flags | `/proc/modules` |
 
-## Features
+Supports **ARM64 (AArch64)** and **x86-64** binaries. The architecture
+is detected per-library from each ELF's `e_machine`, so a single scanner binary
+handles mixed environments. The CLI emits either human-readable text or a
+single valid JSON document for machine consumption.
 
-- **Multi-architecture**: ARM64 and x86/x86-64 heuristics in a single binary; architecture is detected automatically from each library's ELF header at runtime
-- Compares on-disk and in-memory instruction sequences for candidate functions
-- Filters common benign cases: syscall_cp stubs, PLT/GOT stubs, thin wrappers, tail-call optimisations, and IFUNC alternative implementations
-- x86 includes a lightweight variable-length instruction decoder covering syscall instructions (SYSCALL, INT 0x80, SYSENTER), direct/indirect branches, and NOP sequences
-- **eBPF enumeration**: enumerates all loaded eBPF programs via the `bpf()` syscall and flags hook-capable types (KPROBE, TRACING, LSM, TRACEPOINT, PERF_EVENT, SYSCALL)
-- CLI options to scan a single PID or restrict to a library path/name
-- JSON output mode
-- Small, zero-dependency C program; compiles with a standard GCC toolchain
-
-## Limitations
-
-- Permissions: Root is required to read other processes' `/proc/[pid]/mem` and to enumerate eBPF programs.
-- The x86 instruction decoder is intentionally minimal — it handles the common function-prologue patterns needed for hook detection, not every opcode.
-- eBPF detection is **presence-based**, not behavioural: hook-capable program types are flagged, but a loaded KPROBE or TRACING program is not necessarily malicious. Legitimate security tools (perf, bpftrace, Falco, etc.) use the same types.
-- A kernel-level attacker with rootkit access can patch the BPF subsystem to hide programs from `bpf()` enumeration.
-
-## Quickstart (build & run)
-
-Build with the included Makefile:
+## Quickstart
 
 ```bash
 make
+sudo ./edr_hooks_check          # full system scan
+./edr_hooks_check --self        # current process only, no root needed
+sudo ./edr_hooks_check --json   # machine-readable output
 ```
 
-Run the scanner (binary: `edr_hooks_check`) with root privileges for full scanning:
+### CLI options
 
-```bash
-sudo ./edr_hooks_check
-```
-
-Common options:
-
-- `-p, --pid <PID>`    Scan only the given process ID
-- `-l, --lib <PATH>`   Restrict inspection to a specific library path or filename
-- `-s, --self`         Scan only the current process (no root needed)
-- `-v, --verbose`      Verbose output (use twice for more detail)
-- `-x, --hexdump`      Show hexdump of modified instructions
-- `-j, --json`         Output in JSON format
-- `-h, --help`         Show help
-
-Example: scan PID 1234 with verbose output
-
-```bash
-sudo ./edr_hooks_check --pid 1234 --verbose
-```
-
-
-## Detection overview
-
-### Userspace in-memory hooks
-
-- The program reads a window of bytes from the on-disk ELF for each monitored function and from the target process memory.
-- **ARM64**: reads 8 fixed-width 32-bit instructions (32 bytes). Detects SVC removal, suspicious B/BL/BR additions, and checks several benign trampoline patterns.
-- **x86/x86-64**: reads 64 bytes (enough for ~10–15 variable-length instructions). A lightweight decoder identifies syscall instructions (SYSCALL / INT 0x80 / SYSENTER), direct jumps (JMP rel8/rel32, CALL rel32), indirect branches (JMP r/m, CALL r/m), NOPs, and RET. The same disk-vs-memory scoring logic is then applied.
-- Architecture is determined from the ELF `e_machine` field of each library at scan time, so a single scanner binary handles mixed environments.
-- A function is considered suspicious when the disk and in-memory sequences differ, and the in-memory version lacks a syscall instruction that is present on disk — a pattern that strongly indicates in-memory replacement.
-
-### eBPF kernel hook detection
-
-The eBPF scan runs system-wide (not per-process) and uses the `bpf()` syscall directly — no external tools required. Only **hook-capable** program types are reported; networking-only types (XDP, SOCKET_FILTER, SCHED_CLS, …) are ignored entirely.
-
-1. `BPF_PROG_GET_NEXT_ID` loops until `ENOENT` to collect all loaded program IDs.
-2. `BPF_PROG_GET_FD_BY_ID` opens a file descriptor for each program.
-3. `BPF_OBJ_GET_INFO_BY_FD` retrieves `bpf_prog_info`: type, name, UID, and `attach_btf_id`.
-4. For programs that carry an `attach_btf_id` (TRACING, LSM — kernel 5.5+), the kernel vmlinux BTF (ID=1) is opened and the type section is parsed to resolve the BTF type ID to the exact kernel function name being hooked.
-
-Hook-capable types reported:
-
-| Type | Common use |
+| Flag | Meaning |
 |---|---|
-| `KPROBE` | dynamic kernel instrumentation |
-| `TRACING` | fentry/fexit/fmod_ret kernel hooks |
-| `LSM` | Linux Security Module callbacks |
-| `TRACEPOINT` | static kernel tracepoints |
-| `RAW_TRACEPOINT` / `RAW_TP_WRITABLE` | lower-overhead tracepoints |
-| `PERF_EVENT` | perf-based instrumentation |
-| `SYSCALL` | syscall-level programs |
+| `-p, --pid <PID>` | Scan only the given process |
+| `-l, --lib <PATH>` | Restrict userspace inspection to a specific library |
+| `-s, --self` | Self-scan (current PID only); no root required |
+| `-v, --verbose` | Per-source listings (kprobe addresses, function names, …). Use twice for extra detail |
+| `-x, --hexdump` | Show on-disk vs. in-memory instruction bytes for each detected userspace hook |
+| `-j, --json` | Emit the entire report as a single JSON object |
+| `-h, --help` | Show usage and exit |
 
-## Source layout
+### Exit code
 
-| File | Contents |
-|---|---|
-| `src/main.c` | CLI argument parsing and main scan loop |
-| `src/common.h` | Shared types, constants, and function declarations |
-| `src/common.c` | ELF parsing (ELF32 + ELF64), process scanning, output, arch dispatch |
-| `src/arch/arch_arm64.h/c` | ARM64 opcode constants and `detect_hook_confidence_arm64()` |
-| `src/arch/arch_x86.h/c` | x86 instruction decoder and `detect_hook_confidence_x86()` |
-| `src/ebpf/kernel_ebpf.h/c` | eBPF program enumeration via `bpf()` syscall |
+- `0` — no userspace hooks and no kernel-side hook signals detected
+- `1` — at least one of: userspace patched function, eBPF hook program, kprobe, uprobe, or ftrace trampoline found
+
+## Detection mechanisms
+
+### Userspace inline patches
+
+For each monitored library loaded by each scanned process, the scanner:
+
+1. Reads the on-disk `.so` and parses the ELF dynamic symbol table to locate every monitored function's virtual address.
+2. Reads a fixed-size window from both the file (`pread`) and `/proc/PID/mem` at `base_addr + (vaddr − preferred_base)`.
+   - **ARM64**: 8 fixed-width instructions (32 bytes).
+   - **x86-64 / i386**: 64 bytes (≈10–15 variable-length instructions), decoded by a built-in length decoder.
+3. If the bytes differ, runs arch-specific scoring heuristics that filter known benign patterns — PLT stubs, syscall trampolines, tail calls, function epilogues, IFUNC dispatch, thin wrappers ≤ 32 bytes — and classifies the remainder as **LOW / MEDIUM / HIGH** confidence.
+
+### eBPF kernel hooks
+
+Runs system-wide, talks to `bpf()` directly. For each loaded BPF program:
+
+1. `BPF_PROG_GET_NEXT_ID` loops until `ENOENT`.
+2. `BPF_PROG_GET_FD_BY_ID` + `BPF_OBJ_GET_INFO_BY_FD` retrieves type, name, UID, `attach_btf_id`.
+3. Attach target is resolved via three independent paths:
+   - **vmlinux BTF** (`BPF_BTF_GET_FD_BY_ID` on ID 1, parsing the type section) — needed for fentry/fexit/LSM whose target is stored as a BTF type ID.
+   - **`BPF_TASK_FD_QUERY`** walking `/proc/*/fd` — catches BCC-style perf_event attachments where the program is reachable via an open file descriptor but has no `bpf_link` object.
+   - **`BPF_LINK_GET_NEXT_ID`** + `BPF_OBJ_GET_INFO_BY_FD` — catches pinned links (incl. raw_tracepoint / perf_event variants with their concrete attach point).
+
+Only hook-capable types are reported: `KPROBE`, `TRACEPOINT`, `RAW_TRACEPOINT`, `RAW_TP_WRITABLE`, `PERF_EVENT`, `TRACING`, `LSM`, `SYSCALL`. Pure-networking types (XDP, SOCKET_FILTER, SCHED_CLS, …) are intentionally ignored.
+
+### Non-BPF kprobes
+
+`/sys/kernel/debug/kprobes/list` enumerates every active kprobe/kretprobe in the kernel — including those registered by non-BPF tools like SystemTap or by custom kernel modules. Each line is parsed into `{address, type (k/r/p), symbol+offset, active, optimized, ftrace_based}`. Requires root + debugfs mounted.
+
+### uprobes
+
+`tracefs/uprobe_events` lists every uprobe regardless of how it was attached (BPF, perf, manual write). Tried under both `/sys/kernel/tracing/` (modern) and `/sys/kernel/debug/tracing/` (legacy debugfs mount).
+
+### ftrace hooks
+
+`tracefs/enabled_functions` lists every kernel function currently hooked via ftrace. Lines containing `tramp:` indicate a real code redirection (rootkit ftrace abuse is a popular LKM hooking technique because it bypasses direct function patching); lines without are passive tracers. Only trampoline-bearing entries count toward the hook total.
+
+`tracefs/current_tracer` is read separately — if it's anything other than `nop`, the scanner emits a warning entry because kernel-wide function tracing being on is unusual on a production system.
+
+### Active LSMs
+
+`/sys/kernel/security/lsm` is a comma-separated list of activated LSMs (in load order). Known good names are accepted silently; anything else is flagged. The full list is always emitted in JSON mode so machine consumers can verify ordering.
+
+### Tainted kernel modules
+
+`/proc/modules` is parsed for the trailing parenthesised taint flags. The scanner classifies each module as some combination of:
+
+- `O` = out-of-tree
+- `E` = unsigned
+- `F` = force-loaded
+- `P` = proprietary
+
+Out-of-tree + unsigned + forced modules are flagged as worth investigating (a malicious LKM is almost always all three). Proprietary alone is informational (covers legit vendor drivers).
 
 ## Output
 
-Example (trimmed):
+### Text mode (with `-v`)
 
 ```
 ========================================================
@@ -107,19 +111,57 @@ Example (trimmed):
 [+] No /etc/ld.so.preload
 
 [*] Scanning eBPF kernel hooks...
-  security_file_open               [TRACING]
-  do_unlinkat                      [TRACING]
-  sys_enter_open                   [KPROBE]
-    3 kernel hook(s) found
+  security_file_open                  [TRACING]        prog=falco_filopen
+  do_unlinkat                         [KPROBE]         prog=kp_unlink
+    2 kernel hook(s) found  (out of 38 eBPF program(s) seen)
+
+[*] Scanning kprobes...
+  ffffffff8108a2c0   k   __x64_sys_open+0x0 [FTRACE]
+  ffffffff810b5450   r   __x64_sys_kill+0x0
+    2 kprobe(s) registered (2 active)
+
+[*] Scanning uprobes...
+[+] No uprobes registered
+
+[*] Scanning ftrace hooks...
+    14 ftrace hook(s), 0 with custom trampoline — run with -v for the list
+
+[*] Active LSMs...
+  capability
+  yama
+  apparmor
+  bpf
+
+[*] Scanning kernel modules...
+  nvidia                          taint=[OE] out-of-tree UNSIGNED
+  vboxdrv                         taint=[OE] out-of-tree UNSIGNED
+    187 module(s) loaded, 2 flagged (out-of-tree / unsigned / forced)
+
 
 Scanning processes...
 
-[!] PID 1234: 2 hook(s)
-
-SUMMARY
-Processes scanned:    120
-With hooks:           1
-Total hooks:          2
+[!] PID 1234 (sshd): 2 hook(s)
 
 ========================================================
+SUMMARY
+========================================================
+Processes scanned:           42
+Processes w/ userland hooks: 1
+Userspace hooks:             2
+eBPF kernel hooks:           2
+Active kprobes:              2
+uprobes:                     0
+ftrace trampoline hooks:     0
+Unknown LSMs:                0
+Out-of-tree/unsigned mods:   2
+--------------------------------------------------------
+Total signals:               8
+
+[!] Suspicious activity found — investigate above
+    Run with -v for the full per-source listings
+    Run with -x to see userland instruction hexdumps
+========================================================
 ```
+## License
+
+See `LICENSE`.

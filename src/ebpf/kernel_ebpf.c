@@ -370,7 +370,7 @@ static void load_bpf_links(void) {
         switch (info.type) {
         case LINK_TYPE_RAW_TP:
             info.raw_tracepoint.tp_name     = (uint64_t)(uintptr_t)namebuf;
-            info.raw_tracepoint.tp_name_len = sizeof(namebuf);
+            info.raw_tracepoint.tp_name_len = (uint32_t)sizeof(namebuf);
             link_query_info(fd, &info);
             break;
         case LINK_TYPE_PERF_EV:
@@ -378,18 +378,18 @@ static void load_bpf_links(void) {
             case BPF_PE_KPROBE:
             case BPF_PE_KRETPROBE:
                 info.perf_event.kprobe.func_name = (uint64_t)(uintptr_t)namebuf;
-                info.perf_event.kprobe.name_len  = sizeof(namebuf);
+                info.perf_event.kprobe.name_len  = (uint32_t)sizeof(namebuf);
                 link_query_info(fd, &info);
                 break;
             case BPF_PE_TRACEPOINT:
                 info.perf_event.tracepoint.tp_name  = (uint64_t)(uintptr_t)namebuf;
-                info.perf_event.tracepoint.name_len = sizeof(namebuf);
+                info.perf_event.tracepoint.name_len = (uint32_t)sizeof(namebuf);
                 link_query_info(fd, &info);
                 break;
             case BPF_PE_UPROBE:
             case BPF_PE_URETPROBE:
                 info.perf_event.uprobe.file_name = (uint64_t)(uintptr_t)namebuf;
-                info.perf_event.uprobe.name_len  = sizeof(namebuf);
+                info.perf_event.uprobe.name_len  = (uint32_t)sizeof(namebuf);
                 link_query_info(fd, &info);
                 break;
             }

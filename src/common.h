@@ -69,7 +69,7 @@ int  extract_functions_from_elf(const char *lib_path, FunctionInfo *funcs,
 int  get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int verbose);
 int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, int verbose);
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
-int  get_process_name(pid_t pid, char *name, int size);
+int  get_process_name(pid_t pid, char *name, size_t size);
 void check_environment_hooks(const Config *config);
 int  scan_process(pid_t pid, const Config *config, int *first_json);
 

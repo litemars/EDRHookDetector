@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include "kernel_ebpf.h"
+#include "kernel_hooks.h"
 
 static void print_usage(const char *prog_name) {
     printf("Multi-Arch EDR Hook Detector (ARM64 + x86/x86-64)\n");
@@ -80,6 +81,36 @@ int main(int argc, char *argv[]) {
     int ebpf_hooks = scan_ebpf_programs(&config);
     if (ebpf_hooks < 0) ebpf_hooks = 0;
 
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int kprobe_hooks = scan_kprobes(&config);
+    if (kprobe_hooks < 0) kprobe_hooks = 0;
+
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int uprobe_hooks = scan_uprobes(&config);
+    if (uprobe_hooks < 0) uprobe_hooks = 0;
+
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int ftrace_hooks = scan_ftrace_hooks(&config);
+    if (ftrace_hooks < 0) ftrace_hooks = 0;
+
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int unknown_lsms = scan_lsm_modules(&config);
+    if (unknown_lsms < 0) unknown_lsms = 0;
+
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int tainted_mods = scan_tainted_modules(&config);
+    if (tainted_mods < 0) tainted_mods = 0;
+
     if (config.json_output) printf(",\"processes\":[");
     else printf("\n");
 
@@ -135,29 +166,42 @@ int main(int argc, char *argv[]) {
         closedir(proc);
     }
 
+    /* Hooks proper — count toward exit code. */
+    int kernel_hooks = ebpf_hooks + kprobe_hooks + uprobe_hooks + ftrace_hooks;
+    /* Informational findings — surface in the summary but do NOT flip the
+     * exit code (every machine with a 3rd-party driver has tainted modules). */
+    int kernel_warnings = unknown_lsms + tainted_mods;
+    int any_hooks = (hooked > 0) || (kernel_hooks > 0);
+
     if (config.json_output) {
         printf("]}\n");
-        return ((hooked > 0) || (ebpf_hooks > 0)) ? 1 : 0;
+        return any_hooks ? 1 : 0;
     }
 
-    int grand_total = total_hooks + ebpf_hooks;
+    int grand_total = total_hooks + kernel_hooks + kernel_warnings;
     printf("\n========================================================\n");
     printf("SUMMARY\n");
     printf("========================================================\n");
-    printf("Processes scanned:    %d\n", total);
-    printf("Processes w/ hooks:   %d\n", hooked);
-    printf("Userspace hooks:      %d\n", total_hooks);
-    printf("eBPF kernel hooks:    %d\n", ebpf_hooks);
-    printf("Total hooks:          %d\n", grand_total);
+    printf("Processes scanned:           %d\n", total);
+    printf("Processes w/ userland hooks: %d\n", hooked);
+    printf("Userspace hooks:             %d\n", total_hooks);
+    printf("eBPF kernel hooks:           %d\n", ebpf_hooks);
+    printf("Active kprobes:              %d\n", kprobe_hooks);
+    printf("uprobes:                     %d\n", uprobe_hooks);
+    printf("ftrace trampoline hooks:     %d\n", ftrace_hooks);
+    printf("Unknown LSMs:                %d\n", unknown_lsms);
+    printf("Out-of-tree/unsigned mods:   %d\n", tainted_mods);
+    printf("--------------------------------------------------------\n");
+    printf("Total signals:               %d\n", grand_total);
 
     if (grand_total == 0) {
-        printf("\n[+] No EDR hooks detected!\n");
+        printf("\n[+] No EDR / rootkit signals detected!\n");
     } else {
-        printf("\n[!] EDR hooks found!\n");
-        if (!config.verbose)      printf("    Run with -v for details\n");
-        if (!config.show_hexdump) printf("    Run with -x to see instruction hexdumps\n");
+        printf("\n[!] Suspicious activity found — investigate above\n");
+        if (!config.verbose)      printf("    Run with -v for the full per-source listings\n");
+        if (!config.show_hexdump) printf("    Run with -x to see userland instruction hexdumps\n");
     }
     printf("========================================================\n");
 
-    return ((hooked > 0) || (ebpf_hooks > 0)) ? 1 : 0;
+    return any_hooks ? 1 : 0;
 }

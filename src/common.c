@@ -385,12 +385,12 @@ int read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose)
     return 0;
 }
 
-int get_process_name(pid_t pid, char *name, int size) {
+int get_process_name(pid_t pid, char *name, size_t size) {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     FILE *f = fopen(path, "r");
     if (!f) { snprintf(name, size, "<unknown>"); return -1; }
-    if (fgets(name, size, f)) {
+    if (fgets(name, (int)size, f)) {
         name[strcspn(name, "\n")] = '\0';
         fclose(f);
         return 0;
@@ -539,7 +539,9 @@ int scan_process(pid_t pid, const Config *config, int *first_json) {
 
             HookConfidence confidence;
             if (is_x86)
-                confidence = detect_hook_confidence_x86(disk_buf, mem_buf, (int)check_size);
+                confidence = detect_hook_confidence_x86(
+                    disk_buf, mem_buf, (int)check_size,
+                    libs[i].arch == EM_X86_64);
             else
                 confidence = detect_hook_confidence_arm64(
                     (const uint32_t *)disk_buf, (const uint32_t *)mem_buf);

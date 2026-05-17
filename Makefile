@@ -4,7 +4,7 @@ CFLAGS := -O2 -Wall -Wextra -Wpedantic -Wformat=2 -Wformat-security
 CFLAGS += -Wshadow -Wconversion -Wno-sign-conversion
 CFLAGS += -fstack-protector-strong
 CFLAGS += -D_FORTIFY_SOURCE=2
-CFLAGS += -Isrc -Isrc/arch -Isrc/ebpf
+CFLAGS += -Isrc -Isrc/arch -Isrc/ebpf -Isrc/kernel
 
 LDFLAGS := -ldl
 
@@ -12,7 +12,8 @@ TARGET := edr_hooks_check
 
 SRCS := src/main.c src/common.c \
         src/arch/arch_arm64.c src/arch/arch_x86.c \
-        src/ebpf/kernel_ebpf.c
+        src/ebpf/kernel_ebpf.c \
+        src/kernel/kernel_hooks.c
 OBJS := $(SRCS:.c=.o)
 
 .PHONY: all static clean run

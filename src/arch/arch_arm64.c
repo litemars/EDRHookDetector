@@ -36,7 +36,7 @@ static int is_tail_call_optimization(const uint32_t *insns) {
 static int is_wrapper_function(const uint32_t *insns) {
     if ((insns[0] & ARM64_B_MASK) == ARM64_B_OPCODE) {
         int32_t offset = get_branch_offset(insns[0]);
-        if (offset > 0 && offset < 0x10000) return 1;
+        if (offset > 0 && offset <= 32) return 1;
     }
     return 0;
 }

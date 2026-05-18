@@ -34,7 +34,8 @@ static int modrm_extra(const uint8_t *buf, int buf_len, int pos) {
     return len;
 }
 
-static int x86_decode_insn(const uint8_t *buf, int buf_len, X86InsnInfo *out) {
+static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
+                            X86InsnInfo *out) {
     memset(out, 0, sizeof(*out));
     if (buf_len <= 0) { out->length = 1; return 1; }
 
@@ -52,7 +53,9 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, X86InsnInfo *out) {
         }
     }
 
-    if (pos < buf_len && (buf[pos] & 0xF0) == 0x40)
+    /* REX prefix exists only on x86-64. On i386, 0x40-0x4F are real INC/DEC
+     * reg opcodes — eating them as a prefix would misdecode the next byte. */
+    if (is_64bit && pos < buf_len && (buf[pos] & 0xF0) == 0x40)
         pos++;
 
     if (pos >= buf_len) { out->length = pos ? pos : 1; return out->length; }
@@ -140,11 +143,11 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, X86InsnInfo *out) {
     return pos;
 }
 
-static int x86_decode_sequence(const uint8_t *buf, int len,
+static int x86_decode_sequence(const uint8_t *buf, int len, int is_64bit,
                                 X86InsnInfo *out, int max_out) {
     int pos = 0, n = 0;
     while (pos < len && n < max_out) {
-        int consumed = x86_decode_insn(buf + pos, len - pos, &out[n]);
+        int consumed = x86_decode_insn(buf + pos, len - pos, is_64bit, &out[n]);
         if (consumed <= 0) consumed = 1;
         out[n].length = consumed;
         n++;
@@ -181,18 +184,19 @@ static int disk_has_real_code(const uint8_t *disk, int len) {
 #define MAX_INSNS_X86 24
 
 HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
-                                           const uint8_t *mem, int len) {
+                                           const uint8_t *mem, int len,
+                                           int is_64bit) {
     X86InsnInfo disk_insns[MAX_INSNS_X86];
     X86InsnInfo mem_insns[MAX_INSNS_X86];
 
-    int dn = x86_decode_sequence(disk, len, disk_insns, MAX_INSNS_X86);
-    int mn = x86_decode_sequence(mem,  len, mem_insns,  MAX_INSNS_X86);
+    int dn = x86_decode_sequence(disk, len, is_64bit, disk_insns, MAX_INSNS_X86);
+    int mn = x86_decode_sequence(mem,  len, is_64bit, mem_insns,  MAX_INSNS_X86);
 
     if (is_plt_stub_x86(disk, len)) return HOOK_CONFIDENCE_NONE;
 
     if (dn > 0 && disk_insns[0].is_direct_jump) {
         int32_t off = disk_insns[0].branch_offset;
-        if (off > 0 && off < 0x10000) return HOOK_CONFIDENCE_NONE;
+        if (off > 0 && off <= 32) return HOOK_CONFIDENCE_NONE;
     }
 
     if (has_early_ret(mem_insns, mn) && disk_has_real_code(disk, len)) {

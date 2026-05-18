@@ -188,6 +188,144 @@ static const char *btf_resolve(uint32_t type_id) {
 }
 
 
+struct prog_btf_cache {
+    uint32_t        id;
+    uint8_t        *data;
+    uint32_t        size;
+    const uint8_t  *type_sec;
+    uint32_t        type_len;
+    const char     *str_sec;
+    uint32_t        str_len;
+};
+
+static struct prog_btf_cache g_prog_btf = {0};
+
+static void prog_btf_free(void) {
+    if (g_prog_btf.data) free(g_prog_btf.data);
+    memset(&g_prog_btf, 0, sizeof(g_prog_btf));
+}
+
+static int load_prog_btf(uint32_t btf_id) {
+    if (btf_id == 0) return 0;
+    if (g_prog_btf.id == btf_id && g_prog_btf.data) return 1;
+
+    prog_btf_free();
+
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.start_id = btf_id;
+    int fd = bpf_call(BPF_BTF_GET_FD_BY_ID, &attr, sizeof(attr));
+    if (fd < 0) return 0;
+
+    struct btf_obj_info info;
+    memset(&info, 0, sizeof(info));
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd   = (uint32_t)fd;
+    attr.info.info_len = (uint32_t)sizeof(info);
+    attr.info.info     = (uint64_t)(uintptr_t)&info;
+    if (bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) < 0) {
+        close(fd); return 0;
+    }
+
+    uint32_t sz = info.btf_size;
+    if (sz == 0 || sz > 16u * 1024u * 1024u) { close(fd); return 0; }
+
+    uint8_t *buf = malloc(sz);
+    if (!buf) { close(fd); return 0; }
+
+    memset(&info, 0, sizeof(info));
+    info.btf      = (uint64_t)(uintptr_t)buf;
+    info.btf_size = sz;
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd   = (uint32_t)fd;
+    attr.info.info_len = (uint32_t)sizeof(info);
+    attr.info.info     = (uint64_t)(uintptr_t)&info;
+    int rc = bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
+    close(fd);
+    if (rc < 0) { free(buf); return 0; }
+
+    struct btf_hdr *hdr = (struct btf_hdr *)buf;
+    if (sz < sizeof(*hdr) || hdr->magic != BTF_MAGIC_VAL) {
+        free(buf); return 0;
+    }
+
+    uint32_t ts = hdr->hdr_len + hdr->type_off;
+    uint32_t ss = hdr->hdr_len + hdr->str_off;
+    if (ts + hdr->type_len > sz || ss + hdr->str_len > sz) {
+        free(buf); return 0;
+    }
+
+    g_prog_btf.id       = btf_id;
+    g_prog_btf.data     = buf;
+    g_prog_btf.size     = sz;
+    g_prog_btf.type_sec = buf + ts;
+    g_prog_btf.type_len = hdr->type_len;
+    g_prog_btf.str_sec  = (const char *)(buf + ss);
+    g_prog_btf.str_len  = hdr->str_len;
+    return 1;
+}
+
+static const char *prog_btf_lookup(uint32_t type_id) {
+    if (type_id == 0 || !g_prog_btf.data) return NULL;
+
+    const uint8_t *p   = g_prog_btf.type_sec;
+    const uint8_t *end = p + g_prog_btf.type_len;
+    uint32_t       id  = 0;
+
+    while (p + sizeof(struct btf_typ) <= end) {
+        id++;
+        const struct btf_typ *t = (const struct btf_typ *)p;
+        uint32_t kind  = (t->info >> 24) & 0x1fu;
+        uint32_t vlen  = t->info & 0xffffu;
+        uint32_t extra = btf_extra(kind, vlen);
+        if (extra == UINT32_MAX) break;
+
+        if (id == type_id) {
+            if (t->name_off < g_prog_btf.str_len && g_prog_btf.str_sec[t->name_off])
+                return g_prog_btf.str_sec + t->name_off;
+            return NULL;
+        }
+        p += sizeof(struct btf_typ) + extra;
+    }
+    return NULL;
+}
+
+static const char *btf_resolve_prog(const struct bpf_prog_info *info, int prog_fd) {
+    if (info->btf_id == 0 || info->nr_func_info == 0 ||
+        info->func_info_rec_size < 8u) {
+        return NULL;
+    }
+
+    size_t finfo_sz = (size_t)info->nr_func_info * info->func_info_rec_size;
+    if (finfo_sz == 0 || finfo_sz > 1u * 1024u * 1024u) return NULL;
+    uint8_t *finfo = malloc(finfo_sz);
+    if (!finfo) return NULL;
+    memset(finfo, 0, finfo_sz);
+
+    struct bpf_prog_info pinfo;
+    memset(&pinfo, 0, sizeof(pinfo));
+    pinfo.nr_func_info       = info->nr_func_info;
+    pinfo.func_info_rec_size = info->func_info_rec_size;
+    pinfo.func_info          = (uint64_t)(uintptr_t)finfo;
+
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd   = (uint32_t)prog_fd;
+    attr.info.info_len = (uint32_t)sizeof(pinfo);
+    attr.info.info     = (uint64_t)(uintptr_t)&pinfo;
+    if (bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) < 0) {
+        free(finfo); return NULL;
+    }
+    uint32_t target_type_id = 0;
+    memcpy(&target_type_id, finfo + 4, sizeof(uint32_t));
+    free(finfo);
+    if (target_type_id == 0) return NULL;
+
+    if (!load_prog_btf(info->btf_id)) return NULL;
+    return prog_btf_lookup(target_type_id);
+}
+
+
 struct attach_entry {
     uint32_t prog_id;
     char     name[256];
@@ -280,9 +418,6 @@ static void load_task_fd_attaches(void) {
     closedir(proc);
 }
 
-/* Layout of bpf_link_info — local definition so we don't need recent kernel
- * UAPI headers. Only the link types we name-resolve are populated; the rest
- * of the union is padded out to the largest variant we care about. */
 
 #define LINK_TYPE_RAW_TP    1
 #define LINK_TYPE_PERF_EV   7
@@ -341,9 +476,6 @@ static int link_query_info(int fd, struct link_info_buf *info) {
     return bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
 }
 
-/* Iterate every BPF link (including pinned ones in bpffs) and recover the
- * attach target. Complements load_task_fd_attaches: a pinned link won't
- * appear in any /proc/<pid>/fd, but is reachable via BPF_LINK_GET_NEXT_ID. */
 static void load_bpf_links(void) {
     uint32_t id = 0;
 
@@ -512,8 +644,8 @@ int scan_ebpf_programs(const Config *config) {
         attr.info.info_len = (uint32_t)sizeof(info);
         attr.info.info     = (uint64_t)(uintptr_t)&info;
         ret = bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
-        close(fd);
         if (ret < 0) {
+            close(fd);
             n_skipped++;
             if (config->verbose && !config->json_output)
                 fprintf(stderr, "[!] OBJ_GET_INFO_BY_FD(id=%u) failed: %s\n",
@@ -521,15 +653,23 @@ int scan_ebpf_programs(const Config *config) {
             continue;
         }
 
-        if (!is_hook_capable(info.type)) continue;
+        if (!is_hook_capable(info.type)) { close(fd); continue; }
         n_hooks++;
 
-        /* Prefer the real attach target recovered from /proc walk (works for
-         * legacy BCC-style perf_event attachments); fall back to BTF for
-         * fentry/fexit/LSM/tracing programs that have attach_btf_id set. */
+        /* Resolution chain, most-authoritative first:
+         *   1. attach_lookup: real kernel/userspace attach target via
+         *      BPF_TASK_FD_QUERY + bpf_link iteration.
+         *   2. btf_resolve_prog: program's own BTF (untruncated function
+         *      name; by BCC convention encodes the attach point).
+         *   3. btf_resolve: vmlinux BTF for fentry/fexit/LSM via attach_btf_id.
+         * Falls through to the (truncated) prog name if all three fail. */
         const char *fn_name = attach_lookup(info.id);
         if (!fn_name)
+            fn_name = btf_resolve_prog(&info, fd);
+        if (!fn_name)
             fn_name = btf_resolve(info.attach_btf_id);
+
+        close(fd);
 
         char prog_name[BPF_OBJ_NAME_LEN + 1];
         memcpy(prog_name, info.name, BPF_OBJ_NAME_LEN);
@@ -584,5 +724,6 @@ int scan_ebpf_programs(const Config *config) {
         g_btf_data = NULL;
     }
     attaches_free();
+    prog_btf_free();
     return n_hooks;
 }

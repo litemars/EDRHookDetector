@@ -162,6 +162,4 @@ Total signals:               8
     Run with -x to see userland instruction hexdumps
 ========================================================
 ```
-## License
 
-See `LICENSE`.

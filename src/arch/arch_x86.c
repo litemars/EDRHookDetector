@@ -5,6 +5,7 @@ typedef struct {
     int     length;
     int     is_syscall;
     int     is_direct_jump;
+    int     is_call;
     int     is_indirect_branch;
     int     is_ret;
     int     is_nop;
@@ -74,6 +75,21 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
                 out->is_nop = 1;
                 pos += modrm_extra(buf, buf_len, pos);
                 break;
+            case 0x38:
+                /* 0F 38 escape (SSSE3/SSE4/AES-NI): third opcode byte + ModRM,
+                 * no immediate. Skipping the extra byte would desynchronise
+                 * every following instruction boundary and could hide a real
+                 * hook later in the window. */
+                if (pos < buf_len) pos++;            /* third opcode byte */
+                pos += modrm_extra(buf, buf_len, pos);
+                break;
+            case 0x3A:
+                /* 0F 3A escape (ROUNDSS/PALIGNR/PCLMULQDQ…): third opcode byte
+                 * + ModRM + a trailing imm8 that this group always carries. */
+                if (pos < buf_len) pos++;            /* third opcode byte */
+                pos += modrm_extra(buf, buf_len, pos);
+                if (pos < buf_len) pos++;            /* imm8 */
+                break;
             default:
                 break;
         }
@@ -112,9 +128,12 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
             break;
 
         case 0xE8:
+            /* CALL rel32 — NOT a jump. Misclassifying it as a direct jump
+             * lets the short-forward-jump whitelist suppress real hooks on
+             * functions that legitimately begin with a CALL (thunks). */
             if (pos + 4 <= buf_len) {
                 memcpy(&out->branch_offset, buf + pos, 4);
-                out->is_direct_jump = 1;
+                out->is_call = 1;
                 pos += 4;
             }
             break;
@@ -181,6 +200,35 @@ static int disk_has_real_code(const uint8_t *disk, int len) {
     return 0;
 }
 
+/* push <imm32>; ret              — 6-byte low-address absolute jump, and
+ * push <lo32>; mov [rsp+4],<hi32>; ret — 14-byte full 64-bit absolute jump.
+ * Both are classic inline-hook trampolines that begin with no branch insn,
+ * so the relative-branch scoring below would score them 0. */
+static int is_push_ret_tramp(const uint8_t *m, int len) {
+    if (len >= 6 && m[0] == 0x68 && m[5] == 0xC3)
+        return 1;
+    if (len >= 14 && m[0] == 0x68 &&
+        m[5] == 0xC7 && m[6] == 0x44 && m[7] == 0x24 && m[8] == 0x04 &&
+        m[13] == 0xC3)
+        return 1;
+    return 0;
+}
+
+/* mov r64, imm64 ; jmp r64 — 12/13-byte full 64-bit absolute jump.
+ *   REX.W B8+rd <imm64>            (10 bytes, dest rax..rdi)
+ *   [REX.B] FF /4                  (jmp r64)
+ * mem[0] is a MOV here, so the indirect-branch check on mem[0] misses it. */
+static int is_mov_imm_jmp_tramp(const uint8_t *m, int len) {
+    if (len < 12) return 0;
+    if ((m[0] & 0xF8) != 0x48) return 0;        /* REX.W (0x48..0x4F) */
+    if ((m[1] & 0xF8) != 0xB8) return 0;        /* MOV r64, imm64       */
+    /* imm64 occupies m[2..9]; the jmp r64 follows at m[10]. */
+    if (m[10] == 0xFF && ((m[11] >> 3) & 7) == 4)            return 1; /* jmp rax..rdi */
+    if (len >= 13 && (m[10] & 0xF8) == 0x40 &&              /* REX.B for r8..r15 */
+        m[11] == 0xFF && ((m[12] >> 3) & 7) == 4)           return 1;
+    return 0;
+}
+
 #define MAX_INSNS_X86 24
 
 HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
@@ -193,6 +241,12 @@ HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
     int mn = x86_decode_sequence(mem,  len, is_64bit, mem_insns,  MAX_INSNS_X86);
 
     if (is_plt_stub_x86(disk, len)) return HOOK_CONFIDENCE_NONE;
+
+    /* Absolute-address trampolines that begin with no relative branch. The
+     * caller only invokes us when mem != disk, and a real function never
+     * starts this way, so a match in memory is a high-confidence hook. */
+    if (is_64bit && (is_push_ret_tramp(mem, len) || is_mov_imm_jmp_tramp(mem, len)))
+        return HOOK_CONFIDENCE_HIGH;
 
     if (dn > 0 && disk_insns[0].is_direct_jump) {
         int32_t off = disk_insns[0].branch_offset;

@@ -63,6 +63,26 @@ static int is_branch_with_link(uint32_t insn) {
     return (insn & ARM64_BL_MASK) == ARM64_BL_OPCODE;
 }
 
+static int is_movz(uint32_t insn) { return (insn & ARM64_MOVZ_MASK) == ARM64_MOVZ; }
+static int is_movk(uint32_t insn) { return (insn & ARM64_MOVK_MASK) == ARM64_MOVK; }
+
+/* movz Xn,#imm ; movk Xn,#imm,lsl#16 [;…] ; br/blr Xn — the canonical
+ * absolute-address trampoline used by hooks that must reach an arbitrary
+ * 64-bit target. It begins with a MOV (not a branch), so the relative-branch
+ * scoring below scores it 0. Requires a consistent destination register
+ * across the MOV chain and the final indirect branch to keep false positives
+ * near zero. Returns 1 on a full match. */
+static int is_movz_movk_br(const uint32_t *insns) {
+    if (!is_movz(insns[0])) return 0;
+    uint32_t rd = insns[0] & 0x1Fu;
+    for (int i = 1; i < CHECK_INSNS; i++) {
+        if (is_indirect_branch(insns[i]))
+            return (((insns[i] >> 5) & 0x1Fu) == rd);   /* BR/BLR Xrd */
+        if (!is_movk(insns[i]) || (insns[i] & 0x1Fu) != rd) return 0;
+    }
+    return 0;
+}
+
 HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t *mem) {
     if (is_syscall_cp_stub(disk))             return HOOK_CONFIDENCE_NONE;
     if (is_plt_stub(disk))                    return HOOK_CONFIDENCE_NONE;
@@ -70,6 +90,10 @@ HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t
     if (is_tail_call_optimization(mem))       return HOOK_CONFIDENCE_NONE;
     if (is_function_epilogue(mem))            return HOOK_CONFIDENCE_NONE;
     if (is_alternative_implementation(disk, mem)) return HOOK_CONFIDENCE_NONE;
+
+    /* Absolute-address MOV/BR trampoline introduced in memory. */
+    if (is_movz_movk_br(mem) && !is_movz_movk_br(disk))
+        return HOOK_CONFIDENCE_HIGH;
 
     int score = 0;
     int disk_has_svc = 0, mem_has_svc = 0;

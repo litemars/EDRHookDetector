@@ -85,6 +85,11 @@ static uint32_t       g_str_len     = 0;
 static int            g_btf_partial = 0;   /* set if iteration aborted on unknown kind */
 
 static uint32_t btf_extra(uint32_t kind, uint32_t vlen) {
+    /* vlen is a 16-bit field in valid BTF, but a corrupt or adversarial blob
+     * could carry a large value that overflows the `vlen * 12` products
+     * below, yielding a tiny result and walking the iterator into garbage.
+     * Reject implausible vlens up front. */
+    if (vlen > 0x10000u) return UINT32_MAX;
     switch (kind) {
         case 1:  return 4;            /* INT */
         case 3:  return 12;           /* ARRAY */

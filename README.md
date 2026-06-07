@@ -1,16 +1,18 @@
 # Multi-Arch EDR & Rootkit Hook Detector
 
-A single Linux binary that audits a live system for the seven most common ways
+A single Linux binary that audits a live system for the most common ways
 an EDR product (or a rootkit) can intercept activity:
 
 | Layer | What's checked | Source of truth |
 |---|---|---|
 | Userspace inline patches | A curated set of hot functions in `libc`, `libssl`, `libcrypto`, `libpthread`, `libdl`, `libpam`, `libaudit` | on-disk `.so` bytes vs. `/proc/PID/mem` |
+| GOT / PLT hijacks | The same curated functions, but imported via the GOT of every loaded module — caught even when the function body is untouched | ELF `JUMP_SLOT`/`GLOB_DAT` relocations vs. live slot value in `/proc/PID/mem` |
 | Env preload | `LD_PRELOAD`, `/etc/ld.so.preload` | filesystem / environment |
 | eBPF programs | Every hook-capable BPF program (KPROBE / TRACING / LSM / TRACEPOINT / PERF_EVENT / SYSCALL) | `bpf()` syscall, BTF, `BPF_TASK_FD_QUERY`, `BPF_LINK_GET_NEXT_ID` |
 | Non-BPF kprobes | Every kprobe/kretprobe, including those from SystemTap or custom LKMs | `/sys/kernel/debug/kprobes/list` |
 | uprobes | Every uprobe, regardless of attachment method | `tracefs/uprobe_events` |
 | ftrace hooks | Functions hooked via ftrace with a custom trampoline (rootkit ftrace-abuse) + the global `current_tracer` state | `tracefs/enabled_functions`, `tracefs/current_tracer` |
+| VDSO tampering | Per-process `[vdso]` pages whose contents diverge from the same-architecture majority (in-place vdso patching has no on-disk baseline) | cross-process compare of `[vdso]` bytes from `/proc/PID/mem` |
 | Active LSMs | The list and order of loaded LSMs; unknown names get flagged | `/sys/kernel/security/lsm` |
 | Tainted kernel modules | Loaded modules with `O` (out-of-tree), `E` (unsigned), or `F` (force-loaded) flags | `/proc/modules` |
 
@@ -43,7 +45,9 @@ sudo ./edr_hooks_check --json   # machine-readable output
 ### Exit code
 
 - `0` — no userspace hooks and no kernel-side hook signals detected
-- `1` — at least one of: userspace patched function, eBPF hook program, kprobe, uprobe, or ftrace trampoline found
+- `1` — at least one of: userspace patched function, GOT/PLT hijack, eBPF hook program, kprobe, uprobe, ftrace trampoline, or VDSO anomaly found
+
+  (Unknown LSMs and tainted modules are reported but do **not** by themselves set exit `1` — they are informational on most real systems.)
 
 ## Detection mechanisms
 
@@ -55,7 +59,15 @@ For each monitored library loaded by each scanned process, the scanner:
 2. Reads a fixed-size window from both the file (`pread`) and `/proc/PID/mem` at `base_addr + (vaddr − preferred_base)`.
    - **ARM64**: 8 fixed-width instructions (32 bytes).
    - **x86-64 / i386**: 64 bytes (≈10–15 variable-length instructions), decoded by a built-in length decoder.
-3. If the bytes differ, runs arch-specific scoring heuristics that filter known benign patterns — PLT stubs, syscall trampolines, tail calls, function epilogues, IFUNC dispatch, thin wrappers ≤ 32 bytes — and classifies the remainder as **LOW / MEDIUM / HIGH** confidence.
+3. If the bytes differ, runs arch-specific scoring heuristics that filter known benign patterns — PLT stubs, syscall trampolines, tail calls, function epilogues, IFUNC dispatch, thin wrappers ≤ 32 bytes — and classifies the remainder as **LOW / MEDIUM / HIGH** confidence. The scoring also recognises full-range trampolines that begin with no relative branch: `push imm; ret` and `mov r64, imm64; jmp r64` on x86-64, and `movz/movk…; br Xn` on ARM64.
+
+### GOT / PLT hijacks
+
+Inline patching is not the only way to intercept a call: overwriting a Global Offset Table entry reroutes every call site through the PLT without touching a single byte of the target function, so the inline check above can't see it. For each loaded module (the main executable and every `.so`), the scanner:
+
+1. Parses the module's `JUMP_SLOT` / `GLOB_DAT` relocations (RELA on x86-64/ARM64, REL on i386) and keeps those whose symbol is a monitored function.
+2. Computes each GOT slot's runtime address (`base + (r_offset − preferred_base)`) and reads the live pointer from `/proc/PID/mem`.
+3. Flags the entry when that pointer does **not** land in a legitimate executable mapping. Lazy-bound slots point into the module's own PLT and real interposers (including `LD_PRELOAD`) resolve into on-disk `.so` files — neither trips the check. The signal is specifically a pointer into **anonymous / injected** memory (or an unmapped address), which is the signature of a ptrace-injected trampoline.
 
 ### eBPF kernel hooks
 
@@ -83,6 +95,12 @@ Only hook-capable types are reported: `KPROBE`, `TRACEPOINT`, `RAW_TRACEPOINT`, 
 `tracefs/enabled_functions` lists every kernel function currently hooked via ftrace. Lines containing `tramp:` indicate a real code redirection (rootkit ftrace abuse is a popular LKM hooking technique because it bypasses direct function patching); lines without are passive tracers. Only trampoline-bearing entries count toward the hook total.
 
 `tracefs/current_tracer` is read separately — if it's anything other than `nop`, the scanner emits a warning entry because kernel-wide function tracing being on is unusual on a production system.
+
+### VDSO tampering
+
+The kernel maps the same position-independent `[vdso]` image (`gettimeofday`, `clock_gettime`, `getcpu`) into every process, so its bytes are identical across all processes of a given architecture. A rootkit that patches one process's vdso breaks copy-on-write and leaves that process with a private, modified page that has **no on-disk baseline** to diff against. The scanner reads every readable `[vdso]` via `/proc/PID/mem`, groups them by `(length, FNV-1a hash)`, and flags any variant that is a strict minority among vdsos of the **same length** (same length ⇒ same architecture, so differing content is the tampering signal; a different length is just a 32- vs 64-bit process and is expected).
+
+Limitation: a *global* patch applied before COW would alter every process identically, leaving no minority to flag — detecting that needs a trusted baseline and is out of scope. CRIU-restored processes can legitimately carry a divergent vdso proxy, so treat a hit as "investigate", not proof.
 
 ### Active LSMs
 
@@ -137,6 +155,12 @@ Out-of-tree + unsigned + forced modules are flagged as worth investigating (a ma
   vboxdrv                         taint=[OE] out-of-tree UNSIGNED
     187 module(s) loaded, 2 flagged (out-of-tree / unsigned / forced)
 
+[*] Checking VDSO consistency...
+[+] VDSO consistent across 42 process(es) (1 variant)
+
+[*] Scanning GOT/PLT for hijacks...
+[+] No GOT/PLT hijacks detected
+
 
 Scanning processes...
 
@@ -148,12 +172,14 @@ SUMMARY
 Processes scanned:           42
 Processes w/ userland hooks: 1
 Userspace hooks:             2
+GOT/PLT hijacks:             0
 eBPF kernel hooks:           2
 Active kprobes:              2
 uprobes:                     0
 ftrace trampoline hooks:     0
 Unknown LSMs:                0
 Out-of-tree/unsigned mods:   2
+VDSO anomalies:              0
 --------------------------------------------------------
 Total signals:               8
 

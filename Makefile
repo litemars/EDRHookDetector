@@ -6,7 +6,14 @@ CFLAGS += -fstack-protector-strong
 CFLAGS += -D_FORTIFY_SOURCE=2
 CFLAGS += -Isrc -Isrc/arch -Isrc/ebpf -Isrc/kernel
 
-LDFLAGS := -ldl
+# Auto-generate per-object header dependencies so editing a .h triggers
+# rebuilds of every .c that includes it.
+DEPFLAGS := -MMD -MP
+CFLAGS   += $(DEPFLAGS)
+
+# The scanner makes no dlopen/dlsym calls of its own, so it needs no extra
+# libraries. Keeping this empty also lets `make static` link cleanly on musl.
+LDFLAGS :=
 
 TARGET := edr_hooks_check
 
@@ -25,6 +32,9 @@ $(TARGET): $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Pull in the generated dependency files (no error on first build).
+-include $(OBJS:.o=.d)
 
 # Static build (for portability)
 static: LDFLAGS += -static
@@ -48,4 +58,4 @@ endif
 	./$(TARGET) --pid $(PID) -v
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) $(OBJS:.o=.d)

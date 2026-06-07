@@ -66,12 +66,15 @@ extern const TargetLibEntry target_libs[];
 int  extract_functions_from_elf(const char *lib_path, FunctionInfo *funcs,
                                  int max_funcs, unsigned long *preferred_base_out,
                                  int *arch_out, int verbose);
+void elf_cache_free(void);   /* registered via atexit; exposed for completeness */
 int  get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int verbose);
 int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, int verbose);
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
 int  get_process_name(pid_t pid, char *name, size_t size);
 void check_environment_hooks(const Config *config);
 int  scan_process(pid_t pid, const Config *config, int *first_json);
+int  scan_vdso_consistency(const Config *config);
+int  scan_got_hijacks(const Config *config);
 
 /* Output helpers */
 const char *confidence_str(HookConfidence conf);

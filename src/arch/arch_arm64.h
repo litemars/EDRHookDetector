@@ -23,6 +23,11 @@
 #define ARM64_LDR           0xF9400000u
 #define ARM64_MOV_IMM_MASK  0xFFE00000u
 #define ARM64_MOV_IMM       0xD2800000u
+/* 64-bit MOVZ / MOVK (any hw shift): top 9 bits select sf=1 + opc + class. */
+#define ARM64_MOVZ_MASK     0xFF800000u
+#define ARM64_MOVZ          0xD2800000u
+#define ARM64_MOVK_MASK     0xFF800000u
+#define ARM64_MOVK          0xF2800000u
 
 HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t *mem);
 

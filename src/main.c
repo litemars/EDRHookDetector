@@ -111,6 +111,18 @@ int main(int argc, char *argv[]) {
     int tainted_mods = scan_tainted_modules(&config);
     if (tainted_mods < 0) tainted_mods = 0;
 
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int vdso_anom = scan_vdso_consistency(&config);
+    if (vdso_anom < 0) vdso_anom = 0;
+
+    if (config.json_output) printf(",");
+    else printf("\n");
+
+    int got_hijacks = scan_got_hijacks(&config);
+    if (got_hijacks < 0) got_hijacks = 0;
+
     if (config.json_output) printf(",\"processes\":[");
     else printf("\n");
 
@@ -166,31 +178,35 @@ int main(int argc, char *argv[]) {
         closedir(proc);
     }
 
-    /* Hooks proper — count toward exit code. */
-    int kernel_hooks = ebpf_hooks + kprobe_hooks + uprobe_hooks + ftrace_hooks;
+    /* Hooks proper — count toward exit code. A per-process VDSO that differs
+     * from the same-architecture majority is in-memory tampering, so it
+     * belongs here rather than in the informational warnings bucket. */
+    int kernel_hooks = ebpf_hooks + kprobe_hooks + uprobe_hooks + ftrace_hooks + vdso_anom;
     /* Informational findings — surface in the summary but do NOT flip the
      * exit code (every machine with a 3rd-party driver has tainted modules). */
     int kernel_warnings = unknown_lsms + tainted_mods;
-    int any_hooks = (hooked > 0) || (kernel_hooks > 0);
+    int any_hooks = (hooked > 0) || (kernel_hooks > 0) || (got_hijacks > 0);
 
     if (config.json_output) {
         printf("]}\n");
         return any_hooks ? 1 : 0;
     }
 
-    int grand_total = total_hooks + kernel_hooks + kernel_warnings;
+    int grand_total = total_hooks + kernel_hooks + kernel_warnings + got_hijacks;
     printf("\n========================================================\n");
     printf("SUMMARY\n");
     printf("========================================================\n");
     printf("Processes scanned:           %d\n", total);
     printf("Processes w/ userland hooks: %d\n", hooked);
     printf("Userspace hooks:             %d\n", total_hooks);
+    printf("GOT/PLT hijacks:             %d\n", got_hijacks);
     printf("eBPF kernel hooks:           %d\n", ebpf_hooks);
     printf("Active kprobes:              %d\n", kprobe_hooks);
     printf("uprobes:                     %d\n", uprobe_hooks);
     printf("ftrace trampoline hooks:     %d\n", ftrace_hooks);
     printf("Unknown LSMs:                %d\n", unknown_lsms);
     printf("Out-of-tree/unsigned mods:   %d\n", tainted_mods);
+    printf("VDSO anomalies:              %d\n", vdso_anom);
     printf("--------------------------------------------------------\n");
     printf("Total signals:               %d\n", grand_total);
 

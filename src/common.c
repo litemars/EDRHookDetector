@@ -1003,16 +1003,28 @@ static int module_gots(const char *path, GotSlot *out, int max_out,
     return rc;
 }
 
-typedef struct { unsigned long start, end; int legit; char name[32]; } MemRegion;
+typedef struct { unsigned long start, end; int legit, exec; char name[32]; } MemRegion;
 typedef struct { char path[512]; unsigned long base; } GotModule;
 
-/* Return the label of the region containing `ptr` if that region is NOT a
- * legitimate call target, else NULL (legit / no finding). */
+/* Return the label of the region containing `ptr` if that region is a hijack
+ * target (executable, non-file-backed code), else NULL (no finding).
+ *
+ * A GOT/PLT hijack redirects a call into attacker-controlled CODE, so the only
+ * thing worth flagging is a pointer into an *executable* mapping that is not a
+ * legitimate on-disk module. Everything else is a false positive:
+ *   - unmapped / below the lowest mapping  -> lazy/unresolved or a misread slot,
+ *     never a live code target;
+ *   - non-executable region                -> a data pointer, not a redirection;
+ *   - file-backed executable (or the vdso)  -> normal binding, lazy PLT stubs and
+ *     LD_PRELOAD interposers all land here. */
 static const char *classify_got_target(const MemRegion *regs, int n, unsigned long ptr) {
-    for (int i = 0; i < n; i++)
-        if (ptr >= regs[i].start && ptr < regs[i].end)
-            return regs[i].legit ? NULL : (regs[i].name[0] ? regs[i].name : "anon");
-    return "unmapped";
+    for (int i = 0; i < n; i++) {
+        if (ptr < regs[i].start || ptr >= regs[i].end) continue;
+        if (!regs[i].exec)  return NULL;   /* not executable -> not a code hook   */
+        if (regs[i].legit)  return NULL;   /* real module / vdso -> legit target  */
+        return regs[i].name[0] ? regs[i].name : "anon-exec";
+    }
+    return NULL;   /* unmapped -> not a resolved call target, not a hook */
 }
 
 static void basename_into(char *dst, size_t dsz, const char *path) {
@@ -1044,7 +1056,8 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json) {
         if (nreg < GOT_MAX_REGIONS) {
             regs[nreg].start = start;
             regs[nreg].end   = end;
-            regs[nreg].legit = exec && has_path &&
+            regs[nreg].exec  = exec;
+            regs[nreg].legit = has_path &&
                                (path[0] == '/' ||
                                 strcmp(path, "[vdso]") == 0 ||
                                 strcmp(path, "[vsyscall]") == 0);

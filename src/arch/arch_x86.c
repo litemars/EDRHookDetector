@@ -54,8 +54,7 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
         }
     }
 
-    /* REX prefix exists only on x86-64. On i386, 0x40-0x4F are real INC/DEC
-     * reg opcodes — eating them as a prefix would misdecode the next byte. */
+    /* REX exists only on x86-64; on i386 0x40-0x4F are INC/DEC opcodes. */
     if (is_64bit && pos < buf_len && (buf[pos] & 0xF0) == 0x40)
         pos++;
 
@@ -76,16 +75,12 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
                 pos += modrm_extra(buf, buf_len, pos);
                 break;
             case 0x38:
-                /* 0F 38 escape (SSSE3/SSE4/AES-NI): third opcode byte + ModRM,
-                 * no immediate. Skipping the extra byte would desynchronise
-                 * every following instruction boundary and could hide a real
-                 * hook later in the window. */
+                /* 0F 38 (SSSE3/SSE4/AES-NI): opcode + ModRM, no imm. */
                 if (pos < buf_len) pos++;            /* third opcode byte */
                 pos += modrm_extra(buf, buf_len, pos);
                 break;
             case 0x3A:
-                /* 0F 3A escape (ROUNDSS/PALIGNR/PCLMULQDQ…): third opcode byte
-                 * + ModRM + a trailing imm8 that this group always carries. */
+                /* 0F 3A (ROUNDSS/PALIGNR…): opcode + ModRM + imm8. */
                 if (pos < buf_len) pos++;            /* third opcode byte */
                 pos += modrm_extra(buf, buf_len, pos);
                 if (pos < buf_len) pos++;            /* imm8 */
@@ -128,9 +123,8 @@ static int x86_decode_insn(const uint8_t *buf, int buf_len, int is_64bit,
             break;
 
         case 0xE8:
-            /* CALL rel32 — NOT a jump. Misclassifying it as a direct jump
-             * lets the short-forward-jump whitelist suppress real hooks on
-             * functions that legitimately begin with a CALL (thunks). */
+            /* CALL rel32 — kept separate from jumps so the short-jump allowlist
+             * doesn't suppress hooks on call-first thunks. */
             if (pos + 4 <= buf_len) {
                 memcpy(&out->branch_offset, buf + pos, 4);
                 out->is_call = 1;
@@ -200,10 +194,8 @@ static int disk_has_real_code(const uint8_t *disk, int len) {
     return 0;
 }
 
-/* push <imm32>; ret              — 6-byte low-address absolute jump, and
- * push <lo32>; mov [rsp+4],<hi32>; ret — 14-byte full 64-bit absolute jump.
- * Both are classic inline-hook trampolines that begin with no branch insn,
- * so the relative-branch scoring below would score them 0. */
+/* push+ret absolute jump: 6-byte (32-bit) or 14-byte (64-bit). Opens with no
+ * branch so the relative-branch scorer misses it. */
 static int is_push_ret_tramp(const uint8_t *m, int len) {
     if (len >= 6 && m[0] == 0x68 && m[5] == 0xC3)
         return 1;
@@ -214,10 +206,8 @@ static int is_push_ret_tramp(const uint8_t *m, int len) {
     return 0;
 }
 
-/* mov r64, imm64 ; jmp r64 — 12/13-byte full 64-bit absolute jump.
- *   REX.W B8+rd <imm64>            (10 bytes, dest rax..rdi)
- *   [REX.B] FF /4                  (jmp r64)
- * mem[0] is a MOV here, so the indirect-branch check on mem[0] misses it. */
+/* movabs r64,imm64 ; jmp r64 — 12/13-byte absolute jump. mem[0] is the MOV
+ * so the indirect-branch check at [0] misses the jump. */
 static int is_mov_imm_jmp_tramp(const uint8_t *m, int len) {
     if (len < 12) return 0;
     if ((m[0] & 0xF8) != 0x48) return 0;        /* REX.W (0x48..0x4F) */
@@ -231,9 +221,9 @@ static int is_mov_imm_jmp_tramp(const uint8_t *m, int len) {
 
 #define MAX_INSNS_X86 24
 
-HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
-                                           const uint8_t *mem, int len,
-                                           int is_64bit) {
+static HookConfidence x86_score(const uint8_t *disk,
+                                const uint8_t *mem, int len,
+                                int is_64bit) {
     X86InsnInfo disk_insns[MAX_INSNS_X86];
     X86InsnInfo mem_insns[MAX_INSNS_X86];
 
@@ -242,9 +232,7 @@ HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
 
     if (is_plt_stub_x86(disk, len)) return HOOK_CONFIDENCE_NONE;
 
-    /* Absolute-address trampolines that begin with no relative branch. The
-     * caller only invokes us when mem != disk, and a real function never
-     * starts this way, so a match in memory is a high-confidence hook. */
+    /* No real function opens this way, so any match here is a hook. */
     if (is_64bit && (is_push_ret_tramp(mem, len) || is_mov_imm_jmp_tramp(mem, len)))
         return HOOK_CONFIDENCE_HIGH;
 
@@ -293,4 +281,16 @@ HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
     if (score >= 2) return HOOK_CONFIDENCE_MEDIUM;
     if (score >= 1) return HOOK_CONFIDENCE_LOW;
     return HOOK_CONFIDENCE_NONE;
+}
+
+/* Hooks that preserve endbr64 and patch from byte 5 slip past the entry check.
+ * Re-score from the post-pad bytes when both images share the opener. */
+HookConfidence detect_hook_confidence_x86(const uint8_t *disk,
+                                          const uint8_t *mem, int len,
+                                          int is_64bit) {
+    HookConfidence c = x86_score(disk, mem, len, is_64bit);
+    if (c == HOOK_CONFIDENCE_NONE && is_64bit && len > 4 &&
+        is_endbr64(disk, len) && is_endbr64(mem, len))
+        c = x86_score(disk + 4, mem + 4, len - 4, is_64bit);
+    return c;
 }

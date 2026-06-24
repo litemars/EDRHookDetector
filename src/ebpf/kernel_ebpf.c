@@ -85,10 +85,7 @@ static uint32_t       g_str_len     = 0;
 static int            g_btf_partial = 0;   /* set if iteration aborted on unknown kind */
 
 static uint32_t btf_extra(uint32_t kind, uint32_t vlen) {
-    /* vlen is a 16-bit field in valid BTF, but a corrupt or adversarial blob
-     * could carry a large value that overflows the `vlen * 12` products
-     * below, yielding a tiny result and walking the iterator into garbage.
-     * Reject implausible vlens up front. */
+    /* vlen is 16-bit in valid BTF; guard against overflow from corrupt blobs. */
     if (vlen > 0x10000u) return UINT32_MAX;
     switch (kind) {
         case 1:  return 4;            /* INT */
@@ -173,10 +170,7 @@ static const char *btf_resolve(uint32_t type_id) {
         uint32_t extra = btf_extra(kind, vlen);
 
         if (extra == UINT32_MAX) {
-            /* Unknown BTF kind (newer kernel). We can't compute the size of
-             * this entry, so we cannot reliably advance past it. Mark BTF
-             * resolution as partial and stop — but only the FIRST time, so
-             * subsequent calls don't keep re-iterating the prefix. */
+            /* Unknown kind from a newer kernel — can't size this entry, stop. */
             g_btf_partial = 1;
             break;
         }
@@ -360,8 +354,7 @@ static int attaches_push(uint32_t prog_id, const char *name) {
     return 0;
 }
 
-/* Layout of union bpf_attr's task_fd_query member, redeclared so we don't
- * depend on the build host's UAPI headers being recent enough. */
+/* Redeclared here to avoid depending on recent UAPI headers. */
 struct tfq_attr {
     uint32_t pid;
     uint32_t fd;
@@ -410,8 +403,7 @@ static void load_task_fd_attaches(void) {
             a.buf_len = (uint32_t)sizeof(namebuf);
 
             int rc = (int)syscall(__NR_bpf, BPF_TASK_FD_QUERY, &a, sizeof(a));
-            /* Most FDs aren't BPF/perf — kernel returns ENOTSUPP/EBADF/etc.
-             * ENOSPC means our buffer is short but prog_id/name are valid. */
+            /* ENOSPC means the buffer was short but prog_id/name are valid. */
             if (rc < 0 && errno != ENOSPC) continue;
             if (a.prog_id == 0) continue;
 
@@ -586,6 +578,19 @@ static const char *prog_type_str(uint32_t type) {
     }
 }
 
+/* Kernel-owned programs, not EDR hooks. Listed but not counted as suspicious;
+ * otherwise HID-BPF on any desktop would trip the detector. */
+static int is_benign_kernel_bpf(const char *prog_name) {
+    static const char *benign[] = {
+        "hid_tail_call",   /* HID-BPF dispatch (drivers/hid/bpf), kernel >= 6.3 */
+        NULL
+    };
+    if (!prog_name || !prog_name[0]) return 0;
+    for (int i = 0; benign[i]; i++)
+        if (strcmp(prog_name, benign[i]) == 0) return 1;
+    return 0;
+}
+
 int scan_ebpf_programs(const Config *config) {
     if (!config->json_output)
         printf("[*] Scanning eBPF kernel hooks...\n");
@@ -598,6 +603,7 @@ int scan_ebpf_programs(const Config *config) {
 
     uint32_t id            = 0;
     int      n_hooks       = 0;
+    int      n_benign      = 0;     /* hook-capable but kernel-owned (HID-BPF …) */
     int      printed       = 0;
     int      n_seen        = 0;     /* total programs the kernel listed */
     int      n_skipped     = 0;     /* programs we couldn't query */
@@ -659,15 +665,12 @@ int scan_ebpf_programs(const Config *config) {
         }
 
         if (!is_hook_capable(info.type)) { close(fd); continue; }
-        n_hooks++;
 
-        /* Resolution chain, most-authoritative first:
-         *   1. attach_lookup: real kernel/userspace attach target via
-         *      BPF_TASK_FD_QUERY + bpf_link iteration.
-         *   2. btf_resolve_prog: program's own BTF (untruncated function
-         *      name; by BCC convention encodes the attach point).
-         *   3. btf_resolve: vmlinux BTF for fentry/fexit/LSM via attach_btf_id.
-         * Falls through to the (truncated) prog name if all three fail. */
+        /* Resolve the attach target in priority order:
+         *   1. attach_lookup    — TASK_FD_QUERY + bpf_link (most authoritative).
+         *   2. btf_resolve_prog — program BTF (BCC stores the attach point here).
+         *   3. btf_resolve      — vmlinux BTF via attach_btf_id (fentry/fexit/LSM).
+         * Falls back to the truncated prog name if all three miss. */
         const char *fn_name = attach_lookup(info.id);
         if (!fn_name)
             fn_name = btf_resolve_prog(&info, fd);
@@ -680,23 +683,28 @@ int scan_ebpf_programs(const Config *config) {
         memcpy(prog_name, info.name, BPF_OBJ_NAME_LEN);
         prog_name[BPF_OBJ_NAME_LEN] = '\0';
 
+        int benign = is_benign_kernel_bpf(prog_name);
+        if (benign) n_benign++; else n_hooks++;
+
         if (config->json_output) {
             if (printed > 0) printf(",");
             printf("{\"kernel_function\":\"");
             if (fn_name) json_print_escaped(fn_name);
             printf("\",\"prog_type\":\"%s\",\"prog_name\":\"", prog_type_str(info.type));
             json_print_escaped(prog_name);
-            printf("\",\"uid\":%u}", info.created_by_uid);
+            printf("\",\"uid\":%u,\"benign\":%s}", info.created_by_uid,
+                   benign ? "true" : "false");
         } else {
+            const char *tag = benign ? "  [expected kernel facility]" : "";
             if (fn_name)
-                printf("  %-48s [%-16s] prog=%s\n",
+                printf("  %-48s [%-16s] prog=%s%s\n",
                        fn_name, prog_type_str(info.type),
-                       prog_name[0] ? prog_name : "<unnamed>");
+                       prog_name[0] ? prog_name : "<unnamed>", tag);
             else
-                printf("  %-48s [%-16s]%s\n",
+                printf("  %-48s [%-16s]%s%s\n",
                        prog_name[0] ? prog_name : "<unnamed>",
                        prog_type_str(info.type),
-                       info.attach_btf_id ? " (btf unresolved)" : "");
+                       info.attach_btf_id ? " (btf unresolved)" : "", tag);
         }
         printed++;
     }
@@ -705,7 +713,7 @@ int scan_ebpf_programs(const Config *config) {
         printf("]");
     } else if (print_summary) {
         if (n_hooks == 0)
-            printf("[+] No hook-capable eBPF programs (%d total seen)\n", n_seen);
+            printf("[+] No suspicious eBPF hooks (%d program(s) seen)\n", n_seen);
         else
             printf("    %d kernel hook(s) found  (out of %d eBPF program(s) seen", n_hooks, n_seen);
         if (!n_hooks && n_skipped == 0) {
@@ -715,6 +723,9 @@ int scan_ebpf_programs(const Config *config) {
                 printf(", %d skipped - rerun with -v for details", n_skipped);
             printf(")\n");
         }
+        if (n_benign > 0)
+            printf("    %d expected kernel facility/ies shown, not counted (e.g. HID-BPF)\n",
+                   n_benign);
         if (n_skipped > 0 && n_hooks == 0)
             printf("[!] %d program(s) could not be queried (rerun with -v for details)\n",
                    n_skipped);

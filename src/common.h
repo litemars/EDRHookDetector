@@ -38,7 +38,8 @@ typedef struct {
 } FunctionInfo;
 
 typedef struct {
-    char          path[512];
+    char          path[512];       /* path as shown in the target's /proc/PID/maps  */
+    char          read_path[512];  /* handle to the actually-mapped file, any namespace */
     char          short_name[64];
     unsigned long base_addr;
     unsigned long preferred_base;

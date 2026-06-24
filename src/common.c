@@ -62,9 +62,8 @@ static int is_monitored_function(const char *name, const char *lib_name) {
     return 0;
 }
 
-/* Is `name` a monitored function in ANY library? Used by the GOT scanner,
- * where the importing module is not the defining library, so the per-library
- * association in is_monitored_function() does not apply. */
+/* Like is_monitored_function but ignores which library; the GOT scanner sees
+ * imports, not definitions, so we match on symbol name alone. */
 static int is_monitored_symbol(const char *name) {
     if (!name || !name[0]) return 0;
     for (int i = 0; target_libs[i].lib_pattern != NULL; i++)
@@ -256,10 +255,8 @@ static int extract_elf32(void *elf_map, size_t map_size, const char *lib_path,
 }
 
 /* ── Parsed-ELF cache ────────────────────────────────────────────────────── */
-/* The dynamic-symbol parse of a given library file is identical no matter
- * which process mapped it, so key the result on (st_dev, st_ino) and parse
- * each unique file just once. On a busy host this turns hundreds of repeated
- * mmap/parse/munmap cycles for the shared libc into one. */
+/* Dynamic-symbol parses are keyed on (st_dev, st_ino) so each library file is
+ * parsed once regardless of how many processes map it. */
 
 typedef struct {
     dev_t          dev;
@@ -385,6 +382,19 @@ done:
 
 /* ── Process / memory helpers ────────────────────────────────────────────── */
 
+/* /proc/PID/maps paths only resolve correctly in the target's mount namespace.
+ * For snap/container/chroot processes they open the wrong library, turning
+ * every version mismatch into a phantom hook. The map_files symlink is
+ * namespace-proof and inode-stable but requires CAP_SYS_ADMIN; without it
+ * the raw path is fine (unprivileged self-scan, same namespace). */
+static void resolve_backing_path(pid_t pid, unsigned long start, unsigned long end,
+                                 const char *raw, char *out, size_t outsz) {
+    char mf[64];
+    snprintf(mf, sizeof(mf), "/proc/%d/map_files/%lx-%lx", pid, start, end);
+    if (access(mf, F_OK) == 0) snprintf(out, outsz, "%s", mf);
+    else                       snprintf(out, outsz, "%s", raw);
+}
+
 int get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int verbose) {
     char maps_path[256];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -425,6 +435,8 @@ int get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int ve
 
         snprintf(libs[lib_count].path,       sizeof(libs[lib_count].path),       "%s", path);
         snprintf(libs[lib_count].short_name, sizeof(libs[lib_count].short_name), "%s", lib_name);
+        resolve_backing_path(pid, start, end, path,
+                             libs[lib_count].read_path, sizeof(libs[lib_count].read_path));
         libs[lib_count].base_addr      = start;
         libs[lib_count].preferred_base = 0;
         libs[lib_count].arch           = 0;
@@ -597,7 +609,7 @@ int scan_process(pid_t pid, const Config *config, int *first_json) {
             continue;
 
         libs[i].func_count = extract_functions_from_elf(
-            libs[i].path, libs[i].functions, MAX_FUNCTIONS,
+            libs[i].read_path, libs[i].functions, MAX_FUNCTIONS,
             &libs[i].preferred_base, &libs[i].arch, config->verbose);
 
         int is_x86 = (libs[i].arch == EM_X86_64 || libs[i].arch == EM_386);
@@ -613,7 +625,7 @@ int scan_process(pid_t pid, const Config *config, int *first_json) {
             memset(disk_buf, 0, sizeof(disk_buf));
             memset(mem_buf,  0, sizeof(mem_buf));
 
-            if (read_bytes(libs[i].path, libs[i].functions[j].file_offset,
+            if (read_bytes(libs[i].read_path, libs[i].functions[j].file_offset,
                            disk_buf, check_size, config->verbose) < 0)
                 continue;
 
@@ -681,20 +693,11 @@ int scan_process(pid_t pid, const Config *config, int *first_json) {
 }
 
 /* ── VDSO consistency check ──────────────────────────────────────────────── */
-/* The kernel maps the same [vdso] image (gettimeofday/clock_gettime/…) into
- * every process. Its bytes are position-independent and therefore identical
- * across all processes of a given architecture. A rootkit that patches one
- * process's vdso breaks copy-on-write and leaves that process with a private,
- * modified page — which has no on-disk baseline to diff against. We catch it
- * by comparing vdso contents across processes: group by (length, hash) and
- * flag any variant that is a strict minority among same-length vdsos (same
- * length ⇒ same architecture, so a content mismatch is the tampering signal;
- * different length is just a 32- vs 64-bit process and is expected).
- *
- * Limitation: a global patch of the shared vdso (before COW) would alter every
- * process identically, leaving no minority to flag. That case needs a trusted
- * baseline and is out of scope here. CRIU-restored processes can also carry a
- * vdso proxy that legitimately differs; treat a hit as "investigate", not proof. */
+/* The kernel maps the same vdso into every process of a given arch, so all
+ * copies should be byte-identical. A patched vdso becomes a private COW page
+ * with no on-disk baseline. We detect it by grouping on (length, hash) and
+ * flagging same-length minority variants (same length ⟹ same arch; 32- vs
+ * 64-bit splits are expected). A pre-COW global patch defeats this check. */
 
 #define VDSO_MAX_BYTES     (64u * 1024u)
 #define VDSO_MAX_VARIANTS  32
@@ -782,8 +785,7 @@ int scan_vdso_consistency(const Config *config) {
     closedir(proc);
     free(buf);
 
-    /* A variant is suspicious if another variant of the SAME length has a
-     * strictly larger process count (i.e. it is the same-arch minority). */
+    /* Flag same-length (same-arch) minority variants. */
     int flag[VDSO_MAX_VARIANTS] = {0};
     int suspicious_procs = 0;
     for (int i = 0; i < nvar; i++) {
@@ -827,15 +829,11 @@ int scan_vdso_consistency(const Config *config) {
 }
 
 /* ── GOT / PLT hijack detection ──────────────────────────────────────────── */
-/* Inline-byte diffing misses pointer-table redirection: overwriting a GOT
- * slot reroutes every call through the PLT without altering a single
- * instruction of the target function. We parse the JUMP_SLOT / GLOB_DAT
- * relocations of every file-backed module for imports of monitored functions,
- * read the live slot value from /proc/PID/mem, and flag any whose target does
- * NOT land in a legitimate executable mapping (a real library file or the
- * vdso). Lazy-bound slots point into the module's own PLT (file-backed, exec)
- * and interposers/LD_PRELOAD resolve into real .so files, so neither trips the
- * check — the signal is specifically a pointer into anonymous/injected memory. */
+/* Overwriting a GOT slot reroutes calls without touching function code, so the
+ * inline diff check misses it. We walk each module's JUMP_SLOT/GLOB_DAT
+ * relocations, read the live slot via /proc/PID/mem, and flag any target in an
+ * executable anonymous mapping (injected code). Normal resolution and
+ * LD_PRELOAD always point into file-backed .so regions. */
 
 #ifndef R_X86_64_GLOB_DAT
 #define R_X86_64_GLOB_DAT   6
@@ -1004,19 +1002,10 @@ static int module_gots(const char *path, GotSlot *out, int max_out,
 }
 
 typedef struct { unsigned long start, end; int legit, exec; char name[32]; } MemRegion;
-typedef struct { char path[512]; unsigned long base; } GotModule;
+typedef struct { char path[512]; char rpath[512]; unsigned long base; } GotModule;
 
-/* Return the label of the region containing `ptr` if that region is a hijack
- * target (executable, non-file-backed code), else NULL (no finding).
- *
- * A GOT/PLT hijack redirects a call into attacker-controlled CODE, so the only
- * thing worth flagging is a pointer into an *executable* mapping that is not a
- * legitimate on-disk module. Everything else is a false positive:
- *   - unmapped / below the lowest mapping  -> lazy/unresolved or a misread slot,
- *     never a live code target;
- *   - non-executable region                -> a data pointer, not a redirection;
- *   - file-backed executable (or the vdso)  -> normal binding, lazy PLT stubs and
- *     LD_PRELOAD interposers all land here. */
+/* Returns a label if ptr lands in an executable anonymous region (injected code),
+ * NULL otherwise. Non-exec, file-backed, and unmapped targets are all benign. */
 static const char *classify_got_target(const MemRegion *regs, int n, unsigned long ptr) {
     for (int i = 0; i < n; i++) {
         if (ptr < regs[i].start || ptr >= regs[i].end) continue;
@@ -1072,6 +1061,8 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json) {
                 if (strcmp(mods[i].path, path) == 0) { dup = 1; break; }
             if (!dup) {
                 snprintf(mods[nmod].path, sizeof(mods[nmod].path), "%s", path);
+                resolve_backing_path(pid, start, end, path,
+                                     mods[nmod].rpath, sizeof(mods[nmod].rpath));
                 mods[nmod].base = start;
                 nmod++;
             }
@@ -1087,7 +1078,7 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json) {
     for (int m = 0; m < nmod; m++) {
         int           arch  = 0;
         unsigned long pref  = 0;
-        int           nslot = module_gots(mods[m].path, slots, GOT_MAX_SLOTS, &arch, &pref);
+        int           nslot = module_gots(mods[m].rpath, slots, GOT_MAX_SLOTS, &arch, &pref);
         if (nslot <= 0) continue;
         int ptrsize = (arch == EM_386) ? 4 : 8;
 

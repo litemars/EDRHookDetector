@@ -23,11 +23,17 @@
 #define ARM64_LDR           0xF9400000u
 #define ARM64_MOV_IMM_MASK  0xFFE00000u
 #define ARM64_MOV_IMM       0xD2800000u
-/* 64-bit MOVZ / MOVK (any hw shift): top 9 bits select sf=1 + opc + class. */
+/* 64-bit MOVZ/MOVK: top 9 bits encode sf=1 + opc + class. */
 #define ARM64_MOVZ_MASK     0xFF800000u
 #define ARM64_MOVZ          0xD2800000u
 #define ARM64_MOVK_MASK     0xFF800000u
 #define ARM64_MOVK          0xF2800000u
+/* AArch64 function-entry landing pads: BTI variants (target bits need masking),
+ * paciasp/pacibsp for PAC-signed functions. */
+#define ARM64_BTI_MASK      0xFFFFFF3Fu
+#define ARM64_BTI           0xD503241Fu
+#define ARM64_PACIASP       0xD503233Fu
+#define ARM64_PACIBSP       0xD503237Fu
 
 HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t *mem);
 

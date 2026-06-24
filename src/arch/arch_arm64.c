@@ -66,12 +66,9 @@ static int is_branch_with_link(uint32_t insn) {
 static int is_movz(uint32_t insn) { return (insn & ARM64_MOVZ_MASK) == ARM64_MOVZ; }
 static int is_movk(uint32_t insn) { return (insn & ARM64_MOVK_MASK) == ARM64_MOVK; }
 
-/* movz Xn,#imm ; movk Xn,#imm,lsl#16 [;…] ; br/blr Xn — the canonical
- * absolute-address trampoline used by hooks that must reach an arbitrary
- * 64-bit target. It begins with a MOV (not a branch), so the relative-branch
- * scoring below scores it 0. Requires a consistent destination register
- * across the MOV chain and the final indirect branch to keep false positives
- * near zero. Returns 1 on a full match. */
+/* movz/movk.../br(Xn) — canonical 64-bit absolute-address trampoline. Opens
+ * with a MOV so the branch scorer misses it; requires a consistent register
+ * across the whole chain to keep false positives low. */
 static int is_movz_movk_br(const uint32_t *insns) {
     if (!is_movz(insns[0])) return 0;
     uint32_t rd = insns[0] & 0x1Fu;
@@ -83,7 +80,12 @@ static int is_movz_movk_br(const uint32_t *insns) {
     return 0;
 }
 
-HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t *mem) {
+static int is_landing_pad(uint32_t insn) {
+    return ((insn & ARM64_BTI_MASK) == ARM64_BTI) ||       /* bti / bti c/j/jc */
+           insn == ARM64_PACIASP || insn == ARM64_PACIBSP;  /* paciasp/pacibsp */
+}
+
+static HookConfidence arm64_score(const uint32_t *disk, const uint32_t *mem) {
     if (is_syscall_cp_stub(disk))             return HOOK_CONFIDENCE_NONE;
     if (is_plt_stub(disk))                    return HOOK_CONFIDENCE_NONE;
     if (is_wrapper_function(disk))            return HOOK_CONFIDENCE_NONE;
@@ -129,4 +131,18 @@ HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t
     if (score >= 2) return HOOK_CONFIDENCE_MEDIUM;
     if (score >= 1) return HOOK_CONFIDENCE_LOW;
     return HOOK_CONFIDENCE_NONE;
+}
+
+/* Hooks that preserve the landing pad and redirect from instruction 2 slip past
+ * the entry check. Re-score the post-pad body when both images share the opener. */
+HookConfidence detect_hook_confidence_arm64(const uint32_t *disk, const uint32_t *mem) {
+    HookConfidence c = arm64_score(disk, mem);
+    if (c == HOOK_CONFIDENCE_NONE && disk[0] == mem[0] && is_landing_pad(disk[0])) {
+        uint32_t d2[CHECK_INSNS], m2[CHECK_INSNS];
+        for (int i = 0; i < CHECK_INSNS - 1; i++) { d2[i] = disk[i + 1]; m2[i] = mem[i + 1]; }
+        d2[CHECK_INSNS - 1] = ARM64_NOP;
+        m2[CHECK_INSNS - 1] = ARM64_NOP;
+        c = arm64_score(d2, m2);
+    }
+    return c;
 }

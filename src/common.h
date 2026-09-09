@@ -76,8 +76,6 @@ int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, 
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
 int  get_process_name(pid_t pid, char *name, size_t size);
 void check_environment_hooks(const Config *config, int *incomplete);
-/* `incomplete` is set when a source could not be inspected.  Counts remain
- * usable so callers can report both findings and incomplete coverage. */
 int  scan_process(pid_t pid, const Config *config, int *first_json, int *incomplete);
 int  scan_vdso_consistency(const Config *config, int *incomplete);
 int  scan_got_hijacks(const Config *config, int *incomplete);

@@ -82,11 +82,6 @@ static const unsigned char *elf_runtime_bytes(const struct elf_reloc_view *v,
     return NULL;
 }
 
-/* Hash metadata supplies bounds that DT_SYMTAB itself lacks. The System V
- * nchain is the symbol count (gABI section 8.5). GNU buckets name the first
- * symbol of each contiguous chain; its low-bit terminator must occur before
- * the section's claimed end. See sourceware.org/gnu-gabi/
- * program-loading-and-dynamic-linking.txt, "Hashes". */
 static int elf_symbol_hash_supported(const struct elf_reloc_view *v,
                                      uint64_t addr, uint64_t nsym, int gnu) {
     uint32_t header[4] = {0};
@@ -169,7 +164,6 @@ static int elf_reloc_table(const struct elf_reloc_view *v, uint64_t addr,
     return 1;
 }
 
-/* Call only after validating the complete ELF/program/section headers. */
 static struct elf_reloc_view elf_runtime_view(void *map, size_t sz, int is64) {
     struct elf_reloc_view v = {.data = map, .size = sz, .is64 = is64};
     if (is64) {
@@ -226,9 +220,6 @@ static int elf_dynamic_values(const struct elf_reloc_view *v,
     return 1;
 }
 
-/* Section metadata must identify the same symbol names that the loader uses.
- * Otherwise an intact relocation table can be hidden by linking it to dummy
- * symbols/strings, and inline extraction can silently lose its monitored names. */
 static int elf_runtime_symbols_supported(void *map, size_t sz, int is64) {
     struct elf_reloc_view v = elf_runtime_view(map, sz, is64);
     enum { SYM_ADDR, STR_ADDR, SYM_ENT, STR_SIZE, SYSV_HASH, GNU_HASH, TAG_COUNT };

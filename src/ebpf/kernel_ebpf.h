@@ -3,6 +3,6 @@
 
 #include "common.h"
 
-int scan_ebpf_programs(const Config *config);
+int scan_ebpf_programs(const Config *config, int *incomplete);
 
 #endif /* KERNEL_EBPF_H */

@@ -7,16 +7,16 @@ an EDR product (or a rootkit) can intercept activity:
 |---|---|---|
 | Userspace inline patches | A curated set of hot functions in `libc`, `libssl`, `libcrypto`, `libpthread`, `libdl`, `libpam`, `libaudit` | on-disk `.so` bytes vs. `/proc/PID/mem` |
 | GOT / PLT hijacks | The same curated functions, but imported via the GOT of every loaded module — caught even when the function body is untouched | ELF `JUMP_SLOT`/`GLOB_DAT` relocations vs. live slot value in `/proc/PID/mem` |
-| Env preload | `LD_PRELOAD`, `/etc/ld.so.preload` | filesystem / environment |
+| Env preload | Each selected process's initial `LD_PRELOAD` and target-root `/etc/ld.so.preload` | `/proc/PID/environ`, `/proc/PID/root/etc/ld.so.preload` |
 | eBPF programs | Every hook-capable BPF program (KPROBE / TRACING / LSM / TRACEPOINT / PERF_EVENT / SYSCALL) | `bpf()` syscall, BTF, `BPF_TASK_FD_QUERY`, `BPF_LINK_GET_NEXT_ID` |
 | Non-BPF kprobes | Every kprobe/kretprobe, including those from SystemTap or custom LKMs | `/sys/kernel/debug/kprobes/list` |
-| uprobes | Every uprobe, regardless of attachment method | `tracefs/uprobe_events` |
-| ftrace hooks | Functions hooked via ftrace with a custom trampoline (rootkit ftrace-abuse) + the global `current_tracer` state | `tracefs/enabled_functions`, `tracefs/current_tracer` |
+| uprobes | Tracefs-registered uprobe events; other attachment methods explicitly remain incomplete | `tracefs/uprobe_events` |
+| ftrace hooks | IPMODIFY / direct-call redirection signals, separate trampoline metadata, and global `current_tracer` state | `tracefs/enabled_functions`, `tracefs/current_tracer` |
 | VDSO tampering | Per-process `[vdso]` pages whose contents diverge from the same-architecture majority (in-place vdso patching has no on-disk baseline) | cross-process compare of `[vdso]` bytes from `/proc/PID/mem` |
 | Active LSMs | The list and order of loaded LSMs; unknown names get flagged | `/sys/kernel/security/lsm` |
 | Tainted kernel modules | Loaded modules with `O` (out-of-tree), `E` (unsigned), or `F` (force-loaded) flags | `/proc/modules` |
 
-Supports **ARM64 (AArch64)** and **x86-64** binaries. The architecture
+Supports **ARM64 (AArch64)**, **x86-64** and **i386** target ELF images. The architecture
 is detected per-library from each ELF's `e_machine`, so a single scanner binary
 handles mixed environments. The CLI emits either human-readable text or a
 single valid JSON document for machine consumption.
@@ -26,7 +26,7 @@ single valid JSON document for machine consumption.
 ```bash
 make
 sudo ./edr_hooks_check          # full system scan
-./edr_hooks_check --self        # current process only, no root needed
+./edr_hooks_check --self --scope userspace  # own process; VDSO still uses system-wide peers
 sudo ./edr_hooks_check --json   # machine-readable output
 ```
 
@@ -34,13 +34,21 @@ sudo ./edr_hooks_check --json   # machine-readable output
 
 | Flag | Meaning |
 |---|---|
-| `-p, --pid <PID>` | Scan only the given process |
-| `-l, --lib <PATH>` | Restrict userspace inspection to a specific library |
-| `-s, --self` | Self-scan (current PID only); no root required |
+| `-p, --pid <PID>` | Select a process for inline, GOT, and preload checks |
+| `-l, --lib <PATH>` | Match a path/name substring for inline libraries and GOT importing modules; preload and VDSO checks retain their scope |
+| `-s, --self` | Select the current PID for inline, GOT, and preload checks |
+| `--scope <NAME>` | `all` (default), `userspace`, or `kernel` |
 | `-v, --verbose` | Per-source listings (kprobe addresses, function names, …). Use twice for extra detail |
-| `-x, --hexdump` | Show on-disk vs. in-memory instruction bytes for each detected userspace hook |
+| `-x, --hexdump` | Show on-disk vs. in-memory instruction bytes for each detected userspace hook; enables verbose output |
 | `-j, --json` | Emit the entire report as a single JSON object |
 | `-h, --help` | Show usage and exit |
+
+`userspace` runs preload, inline, GOT, and VDSO checks. VDSO comparison always
+uses system-wide peers, including when a PID or library is selected. `kernel`
+runs system-wide eBPF, kprobe, uprobe, ftrace, LSM, and module checks. PID/library
+selectors are rejected with `--scope kernel`; `--self` and `--pid` cannot be
+combined. An unprivileged all-process userspace request falls back to the
+scanner's PID, which is recorded in the JSON scope.
 
 ### Exit code
 
@@ -55,7 +63,7 @@ sudo ./edr_hooks_check --json   # machine-readable output
 
 For each monitored library loaded by each scanned process, the scanner:
 
-1. Reads the on-disk `.so` and parses the ELF dynamic symbol table to locate every monitored function's virtual address.
+1. Opens the mapped library through `/proc/PID/map_files`, falling back to the target-root path only when its device/inode matches the maps record. The descriptor stays open through ELF parsing and baseline byte reads. Selects monitored symbol names independently of the file-access path. This works through `/proc/PID/map_files` handles and includes pthread/libdl functions exported by libc since glibc 2.34.
 2. Reads a fixed-size window from both the file (`pread`) and `/proc/PID/mem` at `base_addr + (vaddr − preferred_base)`.
    - **ARM64**: 8 fixed-width instructions (32 bytes).
    - **x86-64 / i386**: 64 bytes (≈10–15 variable-length instructions), decoded by a built-in length decoder.
@@ -63,7 +71,7 @@ For each monitored library loaded by each scanned process, the scanner:
 
 ### GOT / PLT hijacks
 
-Inline patching is not the only way to intercept a call: overwriting a Global Offset Table entry reroutes every call site through the PLT without touching a single byte of the target function, so the inline check above can't see it. For each loaded module (the main executable and every `.so`), the scanner:
+Inline patching is not the only way to intercept a call: overwriting a Global Offset Table entry reroutes every call site through the PLT without touching a single byte of the target function, so the inline check above can't see it. For each loaded module instance (the main executable and every `.so`), restricted to the importing module path when `--lib` is set, the scanner:
 
 1. Parses the module's `JUMP_SLOT` / `GLOB_DAT` relocations (RELA on x86-64/ARM64, REL on i386) and keeps those whose symbol is a monitored function.
 2. Computes each GOT slot's runtime address (`base + (r_offset − preferred_base)`) and reads the live pointer from `/proc/PID/mem`.
@@ -76,7 +84,7 @@ Runs system-wide, talks to `bpf()` directly. For each loaded BPF program:
 1. `BPF_PROG_GET_NEXT_ID` loops until `ENOENT`.
 2. `BPF_PROG_GET_FD_BY_ID` + `BPF_OBJ_GET_INFO_BY_FD` retrieves type, name, UID, `attach_btf_id`.
 3. Attach target is resolved via three independent paths:
-   - **vmlinux BTF** (`BPF_BTF_GET_FD_BY_ID` on ID 1, parsing the type section) — needed for fentry/fexit/LSM whose target is stored as a BTF type ID.
+   - **Attach BTF** — uses `attach_btf_id` and `attach_btf_obj_id`; discovers vmlinux by kernel metadata and resolves module split-BTF type/string offsets against that base.
    - **`BPF_TASK_FD_QUERY`** walking `/proc/*/fd` — catches BCC-style perf_event attachments where the program is reachable via an open file descriptor but has no `bpf_link` object.
    - **`BPF_LINK_GET_NEXT_ID`** + `BPF_OBJ_GET_INFO_BY_FD` — catches pinned links (incl. raw_tracepoint / perf_event variants with their concrete attach point).
 
@@ -176,16 +184,15 @@ GOT/PLT hijacks:             0
 eBPF kernel hooks:           2
 Active kprobes:              2
 uprobes:                     0
-ftrace trampoline hooks:     0
+ftrace redirection signals:  0
 Unknown LSMs:                0
 Out-of-tree/unsigned mods:   2
 VDSO anomalies:              0
 --------------------------------------------------------
 Total signals:               8
 
-[!] Suspicious activity found — investigate above
-    Run with -v for the full per-source listings
-    Run with -x to see userland instruction hexdumps
+[!] Hook signals detected; investigate the findings above.
+[?] Coverage incomplete; additional findings cannot be ruled out. Sources: uprobes
 ========================================================
 ```
 

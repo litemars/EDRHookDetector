@@ -16,6 +16,7 @@ CFLAGS   += $(DEPFLAGS)
 LDFLAGS :=
 
 TARGET := edr_hooks_check
+STATIC_TARGET := edr_hooks_check_static
 
 SRCS := src/main.c src/common.c \
         src/arch/arch_arm64.c src/arch/arch_x86.c \
@@ -28,7 +29,7 @@ OBJS := $(SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -36,9 +37,6 @@ $(TARGET): $(OBJS)
 # Pull in the generated dependency files (no error on first build).
 -include $(OBJS:.o=.d)
 
-# Static build (for portability)
-static: LDFLAGS += -static
-static: $(TARGET)
 
 # Run the scanner (requires root for full scan)
 run: $(TARGET)
@@ -58,4 +56,4 @@ endif
 	./$(TARGET) --pid $(PID) -v
 
 clean:
-	rm -f $(TARGET) $(OBJS) $(OBJS:.o=.d)
+	rm -f $(TARGET) $(STATIC_TARGET) $(OBJS) $(OBJS:.o=.d)

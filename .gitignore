@@ -1,3 +1,6 @@
 edr_hooks_check
 .DS_store
 tmp
+.test-build/
+edr_hooks_check_static
+tests

@@ -39,9 +39,11 @@ typedef struct {
 
 typedef struct {
     char          path[512];       /* path as shown in the target's /proc/PID/maps  */
-    char          read_path[512];  /* handle to the actually-mapped file, any namespace */
     char          short_name[64];
     unsigned long base_addr;
+    unsigned long map_end;
+    unsigned int  dev_major, dev_minor;
+    uintmax_t     inode;
     unsigned long preferred_base;
     int           arch;          /* e_machine from ELF: EM_AARCH64, EM_X86_64, EM_386 */
     FunctionInfo  functions[MAX_FUNCTIONS];
@@ -68,17 +70,21 @@ int  extract_functions_from_elf(const char *lib_path, FunctionInfo *funcs,
                                  int max_funcs, unsigned long *preferred_base_out,
                                  int *arch_out, int verbose);
 void elf_cache_free(void);   /* registered via atexit; exposed for completeness */
-int  get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int verbose);
+int  get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int verbose,
+                          int *truncated);
 int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, int verbose);
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
 int  get_process_name(pid_t pid, char *name, size_t size);
-void check_environment_hooks(const Config *config);
-int  scan_process(pid_t pid, const Config *config, int *first_json);
-int  scan_vdso_consistency(const Config *config);
-int  scan_got_hijacks(const Config *config);
+void check_environment_hooks(const Config *config, int *incomplete);
+/* `incomplete` is set when a source could not be inspected.  Counts remain
+ * usable so callers can report both findings and incomplete coverage. */
+int  scan_process(pid_t pid, const Config *config, int *first_json, int *incomplete);
+int  scan_vdso_consistency(const Config *config, int *incomplete);
+int  scan_got_hijacks(const Config *config, int *incomplete);
 
 /* Output helpers */
 const char *confidence_str(HookConfidence conf);
 void        json_print_escaped(const char *s);
+void        json_print_string_field(const char *key, const char *value);
 
 #endif /* COMMON_H */

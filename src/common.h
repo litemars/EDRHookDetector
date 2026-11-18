@@ -21,6 +21,7 @@
 #define MAX_PROCESSES    2048
 #define MAX_FUNCTIONS    256
 #define MAX_LIBRARIES    32
+#define MAX_POLICY_RULES 64
 #define CHECK_INSNS      8       /* ARM64: 8 × 4-byte instructions = 32 bytes */
 #define CHECK_BYTES_X86  64      /* x86: enough for ~10–15 variable-length instructions */
 
@@ -51,11 +52,23 @@ typedef struct {
 } LibraryInfo;
 
 typedef struct {
+    char kind[32];
+    char subject[256];
+    char detail[512];
+} PolicyRule;
+
+typedef struct {
     pid_t target_pid;
     char  target_lib[512];
     int   verbose;
     int   json_output;
     int   show_hexdump;
+    char  policy_path[512];
+    char  baseline_root[512];
+    unsigned int watch_seconds;
+    int profile_strict;
+    PolicyRule policy_rules[MAX_POLICY_RULES];
+    int   policy_rule_count;
 } Config;
 
 typedef struct {
@@ -75,10 +88,13 @@ int  get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int v
 int  read_bytes(const char *path, unsigned long offset, void *buf, size_t size, int verbose);
 int  read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose);
 int  get_process_name(pid_t pid, char *name, size_t size);
-void check_environment_hooks(const Config *config, int *incomplete);
+int  check_environment_hooks(const Config *config, int *incomplete);
 int  scan_process(pid_t pid, const Config *config, int *first_json, int *incomplete);
 int  scan_vdso_consistency(const Config *config, int *incomplete);
 int  scan_got_hijacks(const Config *config, int *incomplete);
+int  load_policy_file(Config *config, const char *path);
+int  policy_allows(const Config *config, const char *kind,
+                   const char *subject, const char *detail);
 
 /* Output helpers */
 const char *confidence_str(HookConfidence conf);

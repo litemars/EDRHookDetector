@@ -18,7 +18,7 @@ LDFLAGS :=
 TARGET := edr_hooks_check
 STATIC_TARGET := edr_hooks_check_static
 
-SRCS := src/main.c src/common.c \
+SRCS := src/main.c src/common.c src/sha256.c \
         src/arch/arch_arm64.c src/arch/arch_x86.c \
         src/ebpf/kernel_ebpf.c \
         src/kernel/kernel_hooks.c
@@ -30,6 +30,11 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+static: $(STATIC_TARGET)
+
+$(STATIC_TARGET): $(OBJS)
+	$(CC) -static -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<

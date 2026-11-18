@@ -334,19 +334,19 @@ static int disk_has_real_code(const uint8_t *disk, int len) {
 
 /* push+ret absolute jump: 6-byte (32-bit) or 14-byte (64-bit). Opens with no
  * branch so the relative-branch scorer misses it. */
-static int is_push_ret_tramp(const uint8_t *m, int len) {
+static int push_ret_tramp_len(const uint8_t *m, int len, int is_64bit) {
     if (len >= 6 && m[0] == 0x68 && m[5] == 0xC3)
-        return 1;
-    if (len >= 14 && m[0] == 0x68 &&
+        return 6;
+    if (is_64bit && len >= 14 && m[0] == 0x68 &&
         m[5] == 0xC7 && m[6] == 0x44 && m[7] == 0x24 && m[8] == 0x04 &&
         m[13] == 0xC3)
-        return 1;
+        return 14;
     return 0;
 }
 
 /* movabs r64,imm64 ; jmp r64 — 12/13-byte absolute jump. mem[0] is the MOV
  * so the indirect-branch check at [0] misses the jump. */
-static int is_mov_imm_jmp_tramp(const uint8_t *m, int len) {
+static int mov_imm_jmp_tramp_len(const uint8_t *m, int len) {
     if (len < 12) return 0;
     if ((m[0] & 0xF8) != 0x48) return 0;        /* REX.W (0x48..0x4F) */
     if ((m[1] & 0xF8) != 0xB8) return 0;        /* MOV r64, imm64       */
@@ -358,7 +358,7 @@ static int is_mov_imm_jmp_tramp(const uint8_t *m, int len) {
     }
     if (m[pos] != 0xFF || (m[pos + 1] & 0xF8) != 0xE0) return 0;
     int jump_reg = (m[pos + 1] & 7) | ((jump_rex & 1) << 3);
-    return mov_reg == jump_reg;
+    return mov_reg == jump_reg ? pos + 2 : 0;
 }
 
 #define MAX_INSNS_X86 24
@@ -372,8 +372,13 @@ static HookConfidence x86_score(const uint8_t *disk,
     int dn = x86_decode_sequence(disk, len, is_64bit, disk_insns, MAX_INSNS_X86);
     int mn = x86_decode_sequence(mem,  len, is_64bit, mem_insns,  MAX_INSNS_X86);
 
-    /* No real function opens this way, so any match here is a hook. */
-    if (is_64bit && (is_push_ret_tramp(mem, len) || is_mov_imm_jmp_tramp(mem, len)))
+    /* A newly introduced absolute-address trampoline is high confidence. */
+    int mem_push = push_ret_tramp_len(mem, len, is_64bit);
+    int disk_push = push_ret_tramp_len(disk, len, is_64bit);
+    int mem_mov = is_64bit ? mov_imm_jmp_tramp_len(mem, len) : 0;
+    int disk_mov = is_64bit ? mov_imm_jmp_tramp_len(disk, len) : 0;
+    if ((mem_push && (disk_push != mem_push || memcmp(disk, mem, (size_t)mem_push))) ||
+        (mem_mov && (disk_mov != mem_mov || memcmp(disk, mem, (size_t)mem_mov))))
         return HOOK_CONFIDENCE_HIGH;
 
     if (has_early_ret(mem_insns, mn) && disk_has_real_code(disk, len)) {

@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include "common.h"
+#include "sha256.h"
 #include "arch_arm64.h"
 #include "arch_x86.h"
 #include "elf_validation.h"
 #include <inttypes.h>
 #include <limits.h>
+#include <fnmatch.h>
 #include <sys/types.h>
 #ifdef __linux__
 #include <sys/sysmacros.h>
@@ -66,6 +68,38 @@ static int is_monitored_symbol(const char *name) {
     for (int i = 0; target_libs[i].lib_pattern != NULL; i++)
         for (int j = 0; target_libs[i].functions[j] != NULL; j++)
             if (strcmp(name, target_libs[i].functions[j]) == 0) return 1;
+    return 0;
+}
+
+/* The dentry name rendered in /proc/PID/maps can be libc-2.31.so even when
+ * the loader opened libc.so.6. Match both SONAME and hyphen-version forms,
+ * while requiring an exact library-family boundary (libc must not match
+ * libcap, for example). */
+static int is_target_library_name(const char *name) {
+    char normalized[512];
+    size_t name_len = strlen(name);
+    if (name_len >= 10 && strcmp(name + name_len - 10, " (deleted)") == 0) {
+        name_len -= 10;
+        if (name_len >= sizeof(normalized)) return 0;
+        memcpy(normalized, name, name_len);
+        normalized[name_len] = '\0';
+        name = normalized;
+    }
+    for (int i = 0; target_libs[i].lib_pattern != NULL; i++) {
+        const char *so = strstr(target_libs[i].lib_pattern, ".so");
+        if (!so) continue;
+        size_t family_len = (size_t)(so - target_libs[i].lib_pattern);
+        if (strncmp(name, target_libs[i].lib_pattern, family_len) != 0)
+            continue;
+        const char *suffix = name + family_len;
+        if (!strncmp(suffix, ".so", 3) &&
+            (suffix[3] == '\0' || suffix[3] == '.')) return 1;
+        if (*suffix == '-' && suffix[1] != '\0') {
+            const char *version_so = strstr(suffix + 1, ".so");
+            if (version_so && (version_so[3] == '\0' || version_so[3] == '.'))
+                return 1;
+        }
+    }
     return 0;
 }
 
@@ -232,6 +266,11 @@ static int extract_elf64(void *elf_map, size_t map_size, const char *lib_path,
             const char *name = strtab + symtab[j].st_name;
             if (!memchr(name, '\0', strtab_sh->sh_size - symtab[j].st_name)) return -1;
             if (!is_monitored_symbol(name)) continue;
+            int duplicate = 0;
+            for (int k = 0; k < func_count; k++)
+                if (funcs[k].vaddr == (unsigned long)symtab[j].st_value &&
+                    strcmp(funcs[k].name, name) == 0) duplicate = 1;
+            if (duplicate) continue;
             if (func_count >= max_funcs) { *truncated = 1; continue; }
 
             snprintf(funcs[func_count].name, sizeof(funcs[func_count].name), "%s", name);
@@ -317,6 +356,11 @@ static int extract_elf32(void *elf_map, size_t map_size, const char *lib_path,
             const char *name = strtab + symtab[j].st_name;
             if (!memchr(name, '\0', strtab_sh->sh_size - symtab[j].st_name)) return -1;
             if (!is_monitored_symbol(name)) continue;
+            int duplicate = 0;
+            for (int k = 0; k < func_count; k++)
+                if (funcs[k].vaddr == (unsigned long)symtab[j].st_value &&
+                    strcmp(funcs[k].name, name) == 0) duplicate = 1;
+            if (duplicate) continue;
             if (func_count >= max_funcs) { *truncated = 1; continue; }
 
             snprintf(funcs[func_count].name, sizeof(funcs[func_count].name), "%s", name);
@@ -837,13 +881,9 @@ int get_loaded_libraries(pid_t pid, LibraryInfo **libs_out, int max_libs, int ve
             if (truncated) *truncated = 1;
             continue;
         }
-        if (map.offset != 0 || map.path[0] != '/' || !strstr(map.path, ".so")) continue;
+        if (map.offset != 0 || map.path[0] != '/') continue;
         const char *lib_name = strrchr(map.path, '/') + 1;
-        int is_target = 0;
-        for (int i = 0; target_libs[i].lib_pattern != NULL; i++) {
-            if (strstr(lib_name, target_libs[i].lib_pattern)) { is_target = 1; break; }
-        }
-        if (!is_target) continue;
+        if (!is_target_library_name(lib_name)) continue;
         /* Offset-zero candidates are resolved against PT_LOAD geometry before scanning. */
         if (lib_count >= max_libs) {
             if (truncated) *truncated = 1;
@@ -870,12 +910,14 @@ static int read_fd_bytes(int fd, unsigned long offset, void *buf, size_t size) {
 }
 
 int read_bytes(const char *path, unsigned long offset, void *buf, size_t size, int verbose) {
-    int fd = open(path, O_RDONLY);
+    if ((uintmax_t)offset > INT64_MAX || size > (size_t)SSIZE_MAX) return -1;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (verbose) fprintf(stderr, "[!] Cannot open %s: %s\n", path, strerror(errno));
         return -1;
     }
-    ssize_t got = pread(fd, buf, size, (off_t)offset);
+    ssize_t got;
+    do { got = pread(fd, buf, size, (off_t)offset); } while (got < 0 && errno == EINTR);
     close(fd);
     if (got != (ssize_t)size) {
         if (verbose)
@@ -887,14 +929,16 @@ int read_bytes(const char *path, unsigned long offset, void *buf, size_t size, i
 }
 
 int read_mem(pid_t pid, unsigned long addr, void *buf, size_t size, int verbose) {
+    if ((uintmax_t)addr > INT64_MAX || size > (size_t)SSIZE_MAX) return -1;
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (verbose) fprintf(stderr, "[!] Cannot open %s: %s\n", path, strerror(errno));
         return -1;
     }
-    ssize_t got = pread(fd, buf, size, (off_t)addr);
+    ssize_t got;
+    do { got = pread(fd, buf, size, (off_t)addr); } while (got < 0 && errno == EINTR);
     close(fd);
     if (got != (ssize_t)size) {
         if (verbose > 1)
@@ -930,8 +974,15 @@ const char *confidence_str(HookConfidence conf) {
     }
 }
 
+static int environment_valid_utf8(const char *value);
+static void environment_print_bytes(const char *value);
+
 void json_print_escaped(const char *s) {
     if (!s) return;
+    if (!environment_valid_utf8(s)) {
+        environment_print_bytes(s);
+        return;
+    }
     for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
         switch (c) {
@@ -1003,6 +1054,68 @@ static int read_bounded_source(const char *path, size_t limit, char **out, size_
     return read_bounded_stream(f, limit, out, len);
 }
 
+/* Policy format: allow<TAB>kind-glob<TAB>subject-glob[<TAB>detail-glob].
+ * Tabs preserve spaces inside loader values and paths. Rules only suppress a
+ * signal when every field matches; source coverage remains unchanged. */
+int load_policy_file(Config *config, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    int failed = 0;
+    while ((length = getline(&line, &capacity, f)) >= 0) {
+        if (memchr(line, '\0', (size_t)length) || (size_t)length > 4096u) {
+            errno = EINVAL; failed = 1; break;
+        }
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = '\0';
+        if (!length || line[0] == '#') continue;
+
+        char *cursor = line;
+        char *action = strsep(&cursor, "\t");
+        char *kind = cursor ? strsep(&cursor, "\t") : NULL;
+        char *subject = cursor ? strsep(&cursor, "\t") : NULL;
+        char *detail = cursor ? strsep(&cursor, "\t") : NULL;
+        if (!action || strcmp(action, "allow") || !kind || !*kind ||
+            !subject || !*subject || cursor) {
+            errno = EINVAL; failed = 1; break;
+        }
+        if (!detail || !*detail) detail = "*";
+        if (strlen(kind) >= sizeof(config->policy_rules[0].kind) ||
+            strlen(subject) >= sizeof(config->policy_rules[0].subject) ||
+            strlen(detail) >= sizeof(config->policy_rules[0].detail)) {
+            errno = ENAMETOOLONG; failed = 1; break;
+        }
+        if (config->policy_rule_count >= MAX_POLICY_RULES) {
+            errno = E2BIG; failed = 1; break;
+        }
+        PolicyRule *rule = &config->policy_rules[config->policy_rule_count++];
+        snprintf(rule->kind, sizeof(rule->kind), "%s", kind);
+        snprintf(rule->subject, sizeof(rule->subject), "%s", subject);
+        snprintf(rule->detail, sizeof(rule->detail), "%s", detail);
+    }
+    if (!failed && ferror(f)) { errno = EIO; failed = 1; }
+    int error = errno;
+    free(line);
+    fclose(f);
+    if (failed) { errno = error; return -1; }
+    return 0;
+}
+
+int policy_allows(const Config *config, const char *kind,
+                  const char *subject, const char *detail) {
+    if (!subject) subject = "";
+    if (!detail) detail = "";
+    for (int i = 0; i < config->policy_rule_count; i++) {
+        const PolicyRule *rule = &config->policy_rules[i];
+        if (!fnmatch(rule->kind, kind, 0) &&
+            !fnmatch(rule->subject, subject, 0) &&
+            !fnmatch(rule->detail, detail, 0)) return 1;
+    }
+    return 0;
+}
+
 /* Pin the process root, and reject symlinks rather than following them in the
  * scanner's namespace. Nonblocking open plus a descriptor type check prevents
  * a target-controlled FIFO/device from stalling a system-wide scan. */
@@ -1045,12 +1158,26 @@ static int environment_valid_utf8(const char *value) {
                     *p >= 0xf0 && *p <= 0xf4 ? 4 : 0;
         if (!width) return 0;
         for (int i = 1; i < width; i++)
-            if ((p[i] & 0xc0) != 0x80) return 0;
+            if (p[i] == '\0' || (p[i] & 0xc0) != 0x80) return 0;
         if ((*p == 0xe0 && p[1] < 0xa0) || (*p == 0xed && p[1] >= 0xa0) ||
             (*p == 0xf0 && p[1] < 0x90) || (*p == 0xf4 && p[1] >= 0x90)) return 0;
         p += width;
     }
     return 1;
+}
+
+static int environment_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '\f' || c == '\v';
+}
+
+/* Empty elements and separators do not cause the dynamic loader to preload
+ * anything and should not be reported as active interception indicators. */
+static int preload_has_entry(const char *value, int colon_is_separator) {
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++)
+        if (!environment_space(*p) && (!colon_is_separator || *p != ':'))
+            return 1;
+    return 0;
 }
 
 /* With encoding=bytes, each decoded JSON code point maps to one input byte. */
@@ -1101,7 +1228,7 @@ static void environment_unavailable(const Config *config, pid_t pid,
 
 static void environment_indicator(const Config *config, pid_t pid,
                                   const char *type, const char *source,
-                                  const char *value, int *first) {
+                                  const char *value, int allowed, int *first) {
     int utf8 = environment_valid_utf8(value);
     if (config->json_output) {
         if (!*first) printf(",");
@@ -1116,9 +1243,10 @@ static void environment_indicator(const Config *config, pid_t pid,
         else environment_print_bytes(value);
         printf("\"");
         if (!utf8) printf(",\"encoding\":\"bytes\"");
+        printf(",\"allowed\":%s", allowed ? "true" : "false");
         printf("}");
     } else {
-        printf("[!] PID %d: %s (%s): ", pid, type, source);
+        printf("%s PID %d: %s (%s): ", allowed ? "[~]" : "[!]", pid, type, source);
         if (utf8) json_print_escaped(value);
         else environment_print_bytes(value);
         printf("\n");
@@ -1161,9 +1289,19 @@ static int check_process_environment(pid_t pid, const Config *config,
                 break;
             }
             size_t entry_len = (size_t)(end - (content + pos));
-            if (entry_len > 11 && memcmp(content + pos, "LD_PRELOAD=", 11) == 0) {
-                environment_indicator(config, pid, "LD_PRELOAD", path, content + pos + 11, first);
-                indicators++;
+            if (entry_len > 11 && memcmp(content + pos, "LD_PRELOAD=", 11) == 0 &&
+                preload_has_entry(content + pos + 11, 1)) {
+                const char *value = content + pos + 11;
+                int allowed = policy_allows(config, "preload", value, "LD_PRELOAD");
+                environment_indicator(config, pid, "LD_PRELOAD", path, value, allowed, first);
+                indicators += !allowed;
+            }
+            if (entry_len > 9 && memcmp(content + pos, "LD_AUDIT=", 9) == 0 &&
+                preload_has_entry(content + pos + 9, 1)) {
+                const char *value = content + pos + 9;
+                int allowed = policy_allows(config, "loader", value, "LD_AUDIT");
+                environment_indicator(config, pid, "LD_AUDIT", path, value, allowed, first);
+                indicators += !allowed;
             }
             pos += entry_len + 1;
         }
@@ -1183,16 +1321,79 @@ static int check_process_environment(pid_t pid, const Config *config,
         if (memchr(content, '\0', len)) {
             environment_unavailable(config, pid, path, EINVAL, first, unavailable);
         } else {
-            if (len > 0 && content[len - 1] == '\n') content[len - 1] = '\0';
-            environment_indicator(config, pid, "ld.so.preload", path, content, first);
-            indicators++;
+            if (preload_has_entry(content, 0)) {
+                if (len > 0 && content[len - 1] == '\n') content[len - 1] = '\0';
+                int allowed = policy_allows(config, "preload", content, "ld.so.preload");
+                environment_indicator(config, pid, "ld.so.preload", path, content, allowed, first);
+                indicators += !allowed;
+            }
         }
         free(content);
     }
+
+    /* The dynamic loader also accepts per-exec preload/audit arguments which
+     * never appear in the child's environment. Only interpret options while
+     * argv[0] is itself a known loader name and before its PROGRAM operand. */
+    content = NULL;
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    if (read_bounded_source(path, 1024u * 1024u, &content, &len) < 0) {
+        environment_unavailable(config, pid, path, errno, first, unavailable);
+    } else if (len && content[len - 1] != '\0') {
+        environment_unavailable(config, pid, path, EINVAL, first, unavailable);
+    } else if (len) {
+        char *argv0 = content;
+        const char *base = strrchr(argv0, '/');
+        base = base ? base + 1 : argv0;
+        int is_loader = !strncmp(base, "ld-linux", 8) ||
+                        !strncmp(base, "ld-musl", 7) ||
+                        !strcmp(base, "ld.so");
+        if (is_loader) {
+            size_t pos = strlen(argv0) + 1;
+            while (pos < len) {
+                char *arg = content + pos;
+                size_t arg_len = strlen(arg);
+                if (!strcmp(arg, "--")) break;
+                if (arg[0] != '-') break;
+                const char *option = NULL, *value = NULL;
+                if (!strcmp(arg, "--preload") || !strcmp(arg, "--audit")) {
+                    option = arg;
+                    pos += arg_len + 1;
+                    if (pos >= len) {
+                        environment_unavailable(config, pid, path, EINVAL, first, unavailable);
+                        break;
+                    }
+                    value = content + pos;
+                    arg_len = strlen(value);
+                } else if (!strncmp(arg, "--preload=", 10)) {
+                    option = "--preload";
+                    value = arg + 10;
+                } else if (!strncmp(arg, "--audit=", 8)) {
+                    option = "--audit";
+                    value = arg + 8;
+                } else if (!strcmp(arg, "--argv0") || !strcmp(arg, "--library-path") ||
+                           !strcmp(arg, "--inhibit-rpath") ||
+                           !strcmp(arg, "--glibc-hwcaps-prepend") ||
+                           !strcmp(arg, "--glibc-hwcaps-mask")) {
+                    /* Skip the operand of other known loader options so a
+                     * later --preload/--audit remains visible. */
+                    pos += arg_len + 1;
+                    if (pos >= len) break;
+                    arg_len = strlen(content + pos);
+                }
+                if (option && preload_has_entry(value, 1)) {
+                    int allowed = policy_allows(config, "loader", value, option);
+                    environment_indicator(config, pid, option, path, value, allowed, first);
+                    indicators += !allowed;
+                }
+                pos += arg_len + 1;
+            }
+        }
+    }
+    free(content);
     return indicators;
 }
 
-void check_environment_hooks(const Config *config, int *incomplete) {
+int check_environment_hooks(const Config *config, int *incomplete) {
     int first = 1, unavailable = 0, scanned = 0, indicators = 0;
     if (config->json_output) printf("\"warnings\":[");
     else printf("[*] Checking process preload sources...\n");
@@ -1227,13 +1428,54 @@ void check_environment_hooks(const Config *config, int *incomplete) {
     }
     if (unavailable && incomplete) *incomplete = 1;
     if (config->json_output) printf("]");
-    else if (!unavailable && indicators == 0)
+    else if (!unavailable && indicators == 0 && first)
         printf("[+] No preload indicators in %d process(es) inspected\n", scanned);
+    return indicators;
 }
 
 /* ── Process scanner ─────────────────────────────────────────────────────── */
 
+static int process_starttime(pid_t pid, uint64_t *starttime) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    char *record = NULL;
+    size_t len = 0;
+    if (read_bounded_source(path, 4096, &record, &len) < 0) return -1;
+    char *end_name = strrchr(record, ')');
+    char *cursor = end_name ? end_name + 1 : NULL;
+    int field = 3, found = 0;
+    while (cursor && *cursor) {
+        while (*cursor == ' ') cursor++;
+        if (!*cursor) break;
+        char *end = cursor;
+        while (*end && *end != ' ') end++;
+        if (field == 22) {
+            char saved = *end;
+            *end = '\0';
+            char *number_end;
+            errno = 0;
+            unsigned long long value = strtoull(cursor, &number_end, 10);
+            if (!errno && *cursor && !*number_end) {
+                *starttime = (uint64_t)value;
+                found = 1;
+            }
+            *end = saved;
+            break;
+        }
+        cursor = end;
+        field++;
+    }
+    free(record);
+    if (!found) { errno = EINVAL; return -1; }
+    return 0;
+}
+
 int scan_process(pid_t pid, const Config *config, int *first_json, int *incomplete) {
+    uint64_t initial_starttime = 0;
+    if (process_starttime(pid, &initial_starttime) < 0) {
+        if (incomplete) *incomplete = 1;
+        return 0;
+    }
     LibraryInfo *libs = NULL;
     int libraries_truncated = 0;
     int lib_count = get_loaded_libraries(pid, &libs, MAX_LIBRARIES, config->verbose,
@@ -1259,7 +1501,7 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
     char proc_name[256];
     get_process_name(pid, proc_name, sizeof(proc_name));
 
-    int total_hooks = 0;
+    int total_hooks = 0, emitted_hooks = 0;
     int first_hook  = 1;
 
     for (int i = 0; i < lib_count; i++) {
@@ -1271,15 +1513,44 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
                                    libs[i].dev_major, libs[i].dev_minor,
                                    libs[i].inode, libs[i].path);
         if (fd < 0) { if (incomplete) *incomplete = 1; continue; }
+        int scan_fd = fd;
+        char current_sha256[65] = {0}, baseline_sha256[65] = {0};
+        int baseline_differs = 0;
+        if (config->baseline_root[0]) {
+            char source[sizeof(libs[i].path)];
+            snprintf(source, sizeof(source), "%s", libs[i].path);
+            char *deleted = strstr(source, " (deleted)");
+            if (deleted && deleted[10] == '\0') *deleted = '\0';
+            char trusted[sizeof(config->baseline_root) + sizeof(source)];
+            int needed = source[0] == '/' ?
+                snprintf(trusted, sizeof(trusted), "%s%s", config->baseline_root, source) : -1;
+            int baseline_fd = needed > 0 && (size_t)needed < sizeof(trusted) ?
+                open(trusted, O_RDONLY | O_CLOEXEC) : -1;
+            struct stat baseline_st;
+            if (baseline_fd < 0 || fstat(baseline_fd, &baseline_st) < 0 ||
+                !S_ISREG(baseline_st.st_mode) || baseline_st.st_size < EI_NIDENT ||
+                sha256_fd(fd, current_sha256) < 0 ||
+                sha256_fd(baseline_fd, baseline_sha256) < 0) {
+                if (incomplete) *incomplete = 1;
+                if (config->verbose && !config->json_output)
+                    printf("[?] PID %d: trusted baseline unavailable for %s\n", pid, libs[i].path);
+                if (baseline_fd >= 0) close(baseline_fd);
+                close(fd);
+                continue;
+            }
+            baseline_differs = strcmp(current_sha256, baseline_sha256) != 0;
+            scan_fd = baseline_fd;
+        }
         int functions_truncated = 0;
         libs[i].func_count = extract_functions_from_fd(
-            fd, libs[i].path, libs[i].functions, MAX_FUNCTIONS,
+            scan_fd, libs[i].path, libs[i].functions, MAX_FUNCTIONS,
             &libs[i].preferred_base, &libs[i].arch, config->verbose, &functions_truncated);
         if (functions_truncated && incomplete) *incomplete = 1;
 
         if (libs[i].func_count < 0) {
             if (incomplete) *incomplete = 1;
-            close(fd);
+            close(scan_fd);
+            if (scan_fd != fd) close(fd);
             continue;
         }
 
@@ -1289,15 +1560,50 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
             .inode = libs[i].inode
         };
         ElfInstance instance;
-        if (!open_elf_instance(fd, &candidate, instance_maps, map_count, &instance)) {
+        if (!open_elf_instance(scan_fd, &candidate, instance_maps, map_count, &instance)) {
             if (incomplete) *incomplete = 1;
-            close(fd);
+            close(scan_fd);
+            if (scan_fd != fd) close(fd);
             continue;
         }
         if (instance_already_seen(seen, &seen_count, &candidate, instance.base)) {
             munmap(instance.image, instance.size);
-            close(fd);
+            close(scan_fd);
+            if (scan_fd != fd) close(fd);
             continue;
+        }
+
+        if (baseline_differs) {
+            int allowed = policy_allows(config, "baseline", libs[i].short_name, libs[i].path);
+            if (!allowed || config->json_output || config->verbose) {
+                if (first_hook) {
+                    if (config->json_output) {
+                        if (!*first_json) printf(",");
+                        *first_json = 0;
+                        printf("{\"pid\":%d,\"starttime_ticks\":\"%" PRIu64 "\",",
+                               pid, initial_starttime);
+                        json_print_string_field("name", proc_name);
+                        printf(",\"hooks\":[");
+                    } else if (config->verbose)
+                        printf("\n[!] PID %d (%s):\n", pid, proc_name);
+                    first_hook = 0;
+                }
+                if (config->json_output) {
+                    if (emitted_hooks++ > 0) printf(",");
+                    printf("{\"function\":\"<full-library-image>\",\"kind\":\"baseline\",");
+                    json_print_string_field("library", libs[i].short_name);
+                    printf(",");
+                    json_print_string_field("path", libs[i].path);
+                    printf(",\"current_sha256\":\"%s\",\"trusted_sha256\":\"%s\","
+                           "\"confidence\":\"HIGH\",\"allowed\":%s}",
+                           current_sha256, baseline_sha256, allowed ? "true" : "false");
+                } else if (config->verbose) {
+                    printf("    %s full image differs from trusted baseline: %s\n",
+                           allowed ? "[ALLOW]" : "[HOOK]", libs[i].path);
+                    printf("      current=%s\n      trusted=%s\n", current_sha256, baseline_sha256);
+                }
+                total_hooks += !allowed;
+            }
         }
 
         int is_x86 = (libs[i].arch == EM_X86_64 || libs[i].arch == EM_386);
@@ -1315,25 +1621,29 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
                 continue;
             }
 
-            uint8_t disk_buf[CHECK_BYTES_X86];
-            uint8_t mem_buf[CHECK_BYTES_X86];
+            uint8_t disk_buf[CHECK_BYTES_X86], mem_buf[CHECK_BYTES_X86];
+            uint32_t disk_words[CHECK_INSNS], mem_words[CHECK_INSNS];
             memset(disk_buf, 0, sizeof(disk_buf));
             memset(mem_buf,  0, sizeof(mem_buf));
+            memset(disk_words, 0, sizeof(disk_words));
+            memset(mem_words,  0, sizeof(mem_words));
+            void *disk_data = is_x86 ? (void *)disk_buf : (void *)disk_words;
+            void *mem_data  = is_x86 ? (void *)mem_buf  : (void *)mem_words;
 
-            if (read_fd_bytes(fd, libs[i].functions[j].file_offset,
-                              disk_buf, check_size) < 0)
+            if (read_fd_bytes(scan_fd, libs[i].functions[j].file_offset,
+                              disk_data, check_size) < 0)
             {
                 if (incomplete) *incomplete = 1;
                 continue;
             }
 
-            if (read_mem(pid, mem_addr, mem_buf, check_size, config->verbose) < 0)
+            if (read_mem(pid, mem_addr, mem_data, check_size, config->verbose) < 0)
             {
                 if (incomplete) *incomplete = 1;
                 continue;
             }
 
-            if (memcmp(disk_buf, mem_buf, check_size) == 0) continue;
+            if (memcmp(disk_data, mem_data, check_size) == 0) continue;
 
             HookConfidence confidence;
             if (is_x86)
@@ -1341,16 +1651,19 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
                     disk_buf, mem_buf, (int)check_size,
                     libs[i].arch == EM_X86_64);
             else
-                confidence = detect_hook_confidence_arm64(
-                    (const uint32_t *)disk_buf, (const uint32_t *)mem_buf);
+                confidence = detect_hook_confidence_arm64(disk_words, mem_words);
 
             if (confidence == HOOK_CONFIDENCE_NONE) continue;
+            int allowed = policy_allows(config, "inline", libs[i].short_name,
+                                        libs[i].functions[j].name);
+            if (allowed && !config->json_output && !config->verbose) continue;
 
             if (first_hook) {
                 if (config->json_output) {
                     if (!*first_json) printf(",");
                     *first_json = 0;
-                    printf("{\"pid\":%d,", pid);
+                    printf("{\"pid\":%d,\"starttime_ticks\":\"%" PRIu64 "\",",
+                           pid, initial_starttime);
                     json_print_string_field("name", proc_name);
                     printf(",\"hooks\":[");
                 } else if (config->verbose)
@@ -1359,17 +1672,19 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
             }
 
             if (config->json_output) {
-                if (total_hooks > 0) printf(",");
+                if (emitted_hooks++ > 0) printf(",");
                 printf("{\"function\":\"");
                 json_print_escaped(libs[i].functions[j].name);
                 printf("\",");
                 json_print_string_field("library", libs[i].short_name);
                 printf(",");
                 json_print_string_field("path", libs[i].path);
-                printf(",\"base\":\"0x%lx\",\"address\":\"0x%lx\",\"confidence\":\"%s\"}",
-                       instance.base, mem_addr, confidence_str(confidence));
+                printf(",\"base\":\"0x%lx\",\"address\":\"0x%lx\",\"confidence\":\"%s\","
+                       "\"allowed\":%s}", instance.base, mem_addr,
+                       confidence_str(confidence), allowed ? "true" : "false");
             } else if (config->verbose) {
-                printf("    [HOOK] %s in %s (confidence: %s)\n",
+                printf("    %s %s in %s (confidence: %s)\n",
+                       allowed ? "[ALLOW]" : "[HOOK]",
                        libs[i].functions[j].name,
                        libs[i].short_name,
                        confidence_str(confidence));
@@ -1378,19 +1693,27 @@ int scan_process(pid_t pid, const Config *config, int *first_json, int *incomple
                         print_hexdump_bytes("Disk", disk_buf, (int)check_size);
                         print_hexdump_bytes("Mem ", mem_buf,  (int)check_size);
                     } else {
-                        print_hexdump_words("Disk", (const uint32_t *)disk_buf, CHECK_INSNS);
-                        print_hexdump_words("Mem ", (const uint32_t *)mem_buf,  CHECK_INSNS);
+                        print_hexdump_words("Disk", disk_words, CHECK_INSNS);
+                        print_hexdump_words("Mem ", mem_words,  CHECK_INSNS);
                     }
                 }
             }
-            total_hooks++;
+            total_hooks += !allowed;
         }
         munmap(instance.image, instance.size);
-        close(fd);
+        close(scan_fd);
+        if (scan_fd != fd) close(fd);
     }
 
     if (!first_hook && config->json_output) printf("]}");
 
+    uint64_t final_starttime = 0;
+    if (process_starttime(pid, &final_starttime) < 0 ||
+        final_starttime != initial_starttime) {
+        if (incomplete) *incomplete = 1;
+        if (!config->json_output && config->verbose)
+            printf("[?] PID %d changed identity or exited while it was scanned\n", pid);
+    }
     free(instance_maps);
     free(libs);
     return total_hooks;
@@ -1446,7 +1769,7 @@ static int same_vdso_abi(const VdsoAbi *a, const VdsoAbi *b) {
 }
 
 static uint64_t fnv1a64(const uint8_t *p, size_t n) {
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return h;
 }
@@ -1552,19 +1875,59 @@ int scan_vdso_consistency(const Config *config, int *incomplete) {
     closedir(proc);
     free(buf);
 
-    int comparison_incomplete = scanned < 2 || unavailable > 0;
+    int comparison_incomplete = (config->baseline_root[0] ? scanned < 1 : scanned < 2) ||
+                                unavailable > 0;
     int flag[VDSO_MAX_VARIANTS] = {0};
+    int allowed_variant[VDSO_MAX_VARIANTS] = {0};
     const char *state[VDSO_MAX_VARIANTS];
-    int suspicious_procs = 0;
+    int suspicious_procs = 0, minority_procs = 0;
     for (int i = 0; i < nvar; i++) {
+        if (config->baseline_root[0]) {
+            char trusted_path[sizeof(config->baseline_root) + 128];
+            int needed = snprintf(trusted_path, sizeof(trusted_path),
+                "%s/vdso/%u-%u-%u-%u-%u-%u-%zu.bin", config->baseline_root,
+                (unsigned)var[i].abi.machine, (unsigned)var[i].abi.elf_class,
+                (unsigned)var[i].abi.data, (unsigned)var[i].abi.osabi,
+                (unsigned)var[i].abi.abi_version, (unsigned)var[i].abi.flags,
+                var[i].len);
+            char *trusted = NULL;
+            size_t trusted_len = 0;
+            VdsoAbi trusted_abi;
+            if (needed <= 0 || (size_t)needed >= sizeof(trusted_path) ||
+                read_bounded_source(trusted_path, VDSO_MAX_BYTES,
+                                    &trusted, &trusted_len) < 0 ||
+                trusted_len != var[i].len || !vdso_abi((uint8_t *)trusted,
+                                                       trusted_len, &trusted_abi) ||
+                !same_vdso_abi(&var[i].abi, &trusted_abi)) {
+                state[i] = "baseline_unavailable";
+                comparison_incomplete = 1;
+            } else {
+                flag[i] = memcmp(var[i].bytes, trusted, var[i].len) != 0;
+                state[i] = flag[i] ? "trusted_mismatch" : "trusted_match";
+            }
+            free(trusted);
+            if (flag[i]) {
+                minority_procs += var[i].count;
+                char hash_text[32], detail[64];
+                snprintf(hash_text, sizeof(hash_text), "%016llx",
+                         (unsigned long long)var[i].hash);
+                snprintf(detail, sizeof(detail), "%u:%zu",
+                         (unsigned)var[i].abi.machine, var[i].len);
+                allowed_variant[i] = policy_allows(config, "vdso", hash_text, detail);
+                if (!allowed_variant[i]) suspicious_procs += var[i].count;
+            }
+            continue;
+        }
         int peers = 0, variants = 0, majority = -1;
         for (int j = 0; j < nvar; j++) {
-            if (!same_vdso_abi(&var[i].abi, &var[j].abi)) continue;
+            if (!same_vdso_abi(&var[i].abi, &var[j].abi) ||
+                var[i].len != var[j].len) continue;
             peers += var[j].count;
             variants++;
         }
         for (int j = 0; j < nvar; j++)
-            if (same_vdso_abi(&var[i].abi, &var[j].abi) && var[j].count > peers / 2)
+            if (same_vdso_abi(&var[i].abi, &var[j].abi) &&
+                var[i].len == var[j].len && var[j].count > peers / 2)
                 majority = j;
         if (peers < 2 || majority < 0) {
             state[i] = "inconclusive";
@@ -1574,20 +1937,43 @@ int scan_vdso_consistency(const Config *config, int *incomplete) {
             flag[i] = i != majority;
             state[i] = flag[i] ? "minority" : "majority_reference";
         }
-        if (flag[i]) suspicious_procs += var[i].count;
+        if (flag[i]) {
+            minority_procs += var[i].count;
+            char hash_text[32], detail[64];
+            snprintf(hash_text, sizeof(hash_text), "%016llx",
+                     (unsigned long long)var[i].hash);
+            snprintf(detail, sizeof(detail), "%u:%zu",
+                     (unsigned)var[i].abi.machine, var[i].len);
+            allowed_variant[i] = policy_allows(config, "vdso", hash_text, detail);
+            if (!allowed_variant[i]) suspicious_procs += var[i].count;
+        }
     }
     if (comparison_incomplete && incomplete) *incomplete = 1;
+
+    int groups = 0;
+    for (int i = 0; i < nvar; i++) {
+        int seen_group = 0;
+        for (int j = 0; j < i; j++)
+            if (same_vdso_abi(&var[i].abi, &var[j].abi) &&
+                var[i].len == var[j].len) seen_group = 1;
+        if (!seen_group) groups++;
+    }
 
     if (config->json_output) {
         for (int i = 0; i < nvar; i++) {
             if (i) printf(",");
-            printf("{\"len\":%zu,\"hash\":\"%016llx\",\"processes\":%d,\"example_pid\":%d,",
+            char sha256[65];
+            sha256_bytes(var[i].bytes, var[i].len, sha256);
+            printf("{\"len\":%zu,\"hash\":\"%016llx\",\"sha256\":\"%s\","
+                   "\"processes\":%d,\"example_pid\":%d,",
                    var[i].len, (unsigned long long)var[i].hash,
-                   var[i].count, (int)var[i].pid);
+                   sha256, var[i].count, (int)var[i].pid);
             json_print_string_field("example_name", var[i].name);
-            printf(",\"suspicious\":%s,\"comparison\":\"%s\",\"abi\":{"
+            printf(",\"suspicious\":%s,\"allowed\":%s,\"comparison\":\"%s\",\"abi\":{"
                    "\"class\":%u,\"data\":%u,\"machine\":%u,\"osabi\":%u,"
-                   "\"version\":%u,\"flags\":%u}}", flag[i] ? "true" : "false", state[i],
+                   "\"version\":%u,\"flags\":%u}}",
+                   flag[i] && !allowed_variant[i] ? "true" : "false",
+                   allowed_variant[i] ? "true" : "false", state[i],
                    (unsigned)var[i].abi.elf_class, (unsigned)var[i].abi.data,
                    (unsigned)var[i].abi.machine, (unsigned)var[i].abi.osabi,
                    (unsigned)var[i].abi.abi_version, (unsigned)var[i].abi.flags);
@@ -1596,13 +1982,18 @@ int scan_vdso_consistency(const Config *config, int *incomplete) {
     } else {
         if (suspicious_procs)
             printf("[!] VDSO inconsistency: %d process(es) differ from their ABI's strict majority\n", suspicious_procs);
+        else if (minority_procs)
+            printf("[~] VDSO minority variants are allowed by policy (%d process(es))\n", minority_procs);
         else if (!comparison_incomplete)
-            printf("[+] VDSO consistent across %d process(es) (%d ABI group(s))\n", scanned, nvar);
+            printf("[+] VDSO consistent across %d process(es) (%d content variant(s) in %d ABI/size group(s))\n",
+                   scanned, nvar, groups);
         if (comparison_incomplete)
             printf("[?] VDSO comparison incomplete: insufficient peers, conflicting variants without a strict majority, or %d unavailable process(es)\n", unavailable);
         for (int i = 0; i < nvar; i++)
-            if (flag[i]) printf("    hash=%016llx len=%zu on %d proc(s), e.g. PID %d (%s)\n",
-                (unsigned long long)var[i].hash, var[i].len, var[i].count, (int)var[i].pid, var[i].name);
+            if (flag[i] && (!allowed_variant[i] || config->verbose))
+                printf("    hash=%016llx len=%zu on %d proc(s), e.g. PID %d (%s)%s\n",
+                    (unsigned long long)var[i].hash, var[i].len, var[i].count,
+                    (int)var[i].pid, var[i].name, allowed_variant[i] ? " [ALLOW]" : "");
     }
     for (int i = 0; i < nvar; i++) free(var[i].bytes);
     return suspicious_procs;
@@ -1724,6 +2115,9 @@ static int got64_collect(void *map, size_t sz, int machine,
             const char *nm = str + no;
             if (!memchr(nm, '\0', strn - no)) return -1;
             if (!is_monitored_symbol(nm)) continue;
+            unsigned char sym_type = ELF64_ST_TYPE(syms[si].st_info);
+            if (type == gd && sym_type != STT_FUNC && sym_type != STT_GNU_IFUNC &&
+                sym_type != STT_NOTYPE) continue;
             if (count >= max_out) {
                 if (truncated) *truncated = 1;
                 continue;
@@ -1813,6 +2207,9 @@ static int got32_collect(void *map, size_t sz, GotSlot *out, int max_out,
             const char *nm = str + no;
             if (!memchr(nm, '\0', strn - no)) return -1;
             if (!is_monitored_symbol(nm)) continue;
+            unsigned char sym_type = ELF32_ST_TYPE(syms[si].st_info);
+            if (type == R_386_GLOB_DAT && sym_type != STT_FUNC &&
+                sym_type != STT_GNU_IFUNC && sym_type != STT_NOTYPE) continue;
             if (count >= max_out) {
                 if (truncated) *truncated = 1;
                 continue;
@@ -1872,20 +2269,31 @@ done:
     return rc;
 }
 
-typedef struct { unsigned long start, end; int legit, exec; char name[32]; } MemRegion;
+typedef struct {
+    unsigned long start, end;
+    int legit, exec;
+    uintmax_t inode;
+    char perms[5];
+    char path[512];
+    char name[64];
+} MemRegion;
 typedef struct { ProcMapEntry map; } GotModule;
 
-/* Returns a label for executable anonymous code or an invalid/unmapped target.
- * A resolved function pointer must designate mapped executable code; treating an
- * unmapped target as clean turns a corrupted GOT slot into a false negative. */
-static const char *classify_got_target(const MemRegion *regs, int n, unsigned long ptr) {
+/* Returns a label for a target that is not a persistent legitimate executable
+ * mapping. An unmapped/non-executable function target is invalid, while a
+ * deleted or memfd-backed executable has no on-disk provenance to trust. */
+static const MemRegion *classify_got_target(const MemRegion *regs, int n,
+                                            int inventory_complete, unsigned long ptr,
+                                            const char **label) {
     for (int i = 0; i < n; i++) {
         if (ptr < regs[i].start || ptr >= regs[i].end) continue;
-        if (!regs[i].exec)  return NULL;   /* not executable -> not a code hook   */
+        if (!regs[i].exec)  { *label = "non-executable"; return &regs[i]; }
         if (regs[i].legit)  return NULL;   /* real module / vdso -> legit target  */
-        return regs[i].name[0] ? regs[i].name : "anon-exec";
+        *label = regs[i].name[0] ? regs[i].name : "anon-exec";
+        return &regs[i];
     }
-    return "unmapped";
+    if (inventory_complete) *label = "unmapped";
+    return NULL;
 }
 
 static void basename_into(char *dst, size_t dsz, const char *path) {
@@ -1900,12 +2308,20 @@ static void basename_into(char *dst, size_t dsz, const char *path) {
 
 static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json,
                             int *incomplete) {
+    uint64_t initial_starttime = 0;
+    if (process_starttime(pid, &initial_starttime) < 0) {
+        if (incomplete) *incomplete = 1;
+        return 0;
+    }
     ProcMapEntry *instance_maps = NULL;
-    int map_count = read_instance_maps(pid, &instance_maps, incomplete);
+    int map_inventory_incomplete = 0;
+    int map_count = read_instance_maps(pid, &instance_maps,
+                                       &map_inventory_incomplete);
     if (map_count < 0) {
         if (incomplete) *incomplete = 1;
         return 0;
     }
+    if (map_inventory_incomplete && incomplete) *incomplete = 1;
 
     MemRegion *regs = malloc((size_t)GOT_MAX_REGIONS * sizeof(*regs));
     GotModule *mods = malloc((size_t)GOT_MAX_MODULES * sizeof(*mods));
@@ -1920,18 +2336,26 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json,
         ProcMapEntry map = instance_maps[i];
         int has_path = map.path[0] != '\0';
         if (nreg < GOT_MAX_REGIONS) {
+            size_t path_len = strlen(map.path);
+            int deleted = path_len >= 10 &&
+                          strcmp(map.path + path_len - 10, " (deleted)") == 0;
             regs[nreg].start = map.start;
             regs[nreg].end   = map.end;
             regs[nreg].exec  = map.perms[2] == 'x';
+            regs[nreg].inode = map.inode;
+            snprintf(regs[nreg].perms, sizeof(regs[nreg].perms), "%s", map.perms);
+            snprintf(regs[nreg].path, sizeof(regs[nreg].path), "%s", map.path);
             regs[nreg].legit = has_path &&
-                               (map.path[0] == '/' ||
+                               ((map.path[0] == '/' && map.inode != 0 && !deleted &&
+                                 strncmp(map.path, "/memfd:", 7) != 0) ||
                                 strcmp(map.path, "[vdso]") == 0 ||
                                 strcmp(map.path, "[vsyscall]") == 0);
             if (has_path) basename_into(regs[nreg].name, sizeof(regs[nreg].name), map.path);
             else          snprintf(regs[nreg].name, sizeof(regs[nreg].name), "anon");
             nreg++;
-        } else if (incomplete) {
-            *incomplete = 1;
+        } else {
+            map_inventory_incomplete = 1;
+            if (incomplete) *incomplete = 1;
         }
         if (map.offset == 0 && map.path[0] == '/' &&
             (!config->target_lib[0] || strstr(map.path, config->target_lib))) {
@@ -1997,18 +2421,23 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json,
             }
             if (ptr == 0) continue;     /* unbound weak symbol — not a hook */
 
-            const char *label = classify_got_target(regs, nreg, ptr);
+            const char *label = NULL;
+            const MemRegion *target_region = classify_got_target(
+                regs, nreg, !map_inventory_incomplete, ptr, &label);
             if (!label) continue;
-
-            if (!have_name) { get_process_name(pid, proc_name, sizeof(proc_name)); have_name = 1; }
 
             char modbase[64];
             basename_into(modbase, sizeof(modbase), map->path);
+            int allowed = policy_allows(config, "got", modbase, slots[k].name);
+            if (allowed && !config->json_output && !config->verbose) continue;
+
+            if (!have_name) { get_process_name(pid, proc_name, sizeof(proc_name)); have_name = 1; }
 
             if (config->json_output) {
                 if (!*first_json) printf(",");
                 *first_json = 0;
-                printf("{\"pid\":%d,", pid);
+                printf("{\"pid\":%d,\"starttime_ticks\":\"%" PRIu64 "\",",
+                       pid, initial_starttime);
                 json_print_string_field("name", proc_name);
                 printf(",\"function\":\"");
                 json_print_escaped(slots[k].name);
@@ -2019,16 +2448,33 @@ static int scan_got_for_pid(pid_t pid, const Config *config, int *first_json,
                 printf(",\"base\":\"0x%lx\",\"slot\":\"0x%lx\",\"target\":\"0x%lx\",\"location\":\"",
                        instance.base, addr, ptr);
                 json_print_escaped(label);
-                printf("\"}");
+                printf("\"");
+                if (target_region) {
+                    printf(",");
+                    json_print_string_field("target_path", target_region->path);
+                    printf(",\"target_map_start\":\"0x%lx\",\"target_map_end\":\"0x%lx\",",
+                           target_region->start, target_region->end);
+                    json_print_string_field("target_permissions", target_region->perms);
+                    printf(",\"target_inode\":%ju", target_region->inode);
+                }
+                printf(",\"allowed\":%s}", allowed ? "true" : "false");
             } else {
-                printf("  [GOT] PID %d (%s): %s in %s -> 0x%lx (%s)\n",
-                       pid, proc_name, slots[k].name, modbase, ptr, label);
+                printf("  %s PID %d (%s): %s in %s -> 0x%lx (%s%s%s)\n",
+                       allowed ? "[GOT-ALLOW]" : "[GOT]", pid, proc_name,
+                       slots[k].name, modbase, ptr, label,
+                       target_region && target_region->path[0] ? ", " : "",
+                       target_region && target_region->path[0] ? target_region->path : "");
             }
-            found++;
+            found += !allowed;
         }
         munmap(instance.image, instance.size);
     }
 
+    uint64_t final_starttime = 0;
+    if (process_starttime(pid, &final_starttime) < 0 ||
+        final_starttime != initial_starttime) {
+        if (incomplete) *incomplete = 1;
+    }
     free(instance_maps);
     free(regs);
     free(mods);
@@ -2049,12 +2495,18 @@ int scan_got_hijacks(const Config *config, int *incomplete) {
     } else {
         DIR *proc = opendir("/proc");
         if (proc) {
-            struct dirent *e;
-            while ((e = readdir(proc)) != NULL) {
+            for (;;) {
+                errno = 0;
+                struct dirent *e = readdir(proc);
+                if (!e) {
+                    if (errno && incomplete) *incomplete = 1;
+                    break;
+                }
                 if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
                 char *endp;
+                errno = 0;
                 long  v = strtol(e->d_name, &endp, 10);
-                if (*endp != '\0' || v <= 0) continue;
+                if (errno || *endp != '\0' || v <= 0 || v > INT32_MAX) continue;
                 total += scan_got_for_pid((pid_t)v, config, &first_json, incomplete);
             }
             closedir(proc);

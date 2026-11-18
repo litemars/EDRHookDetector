@@ -97,6 +97,7 @@ struct btf_blob {
 static struct btf_blob g_kernel_btf = {0};
 static struct btf_blob g_object_btf = {0};
 static int g_btf_partial = 0;
+static int g_attach_partial = 0;
 
 static void btf_free(struct btf_blob *btf) {
     free(btf->data);
@@ -361,6 +362,31 @@ struct attach_entry {
 static struct attach_entry *g_attaches     = NULL;
 static int                  g_attaches_n   = 0;
 static int                  g_attaches_cap = 0;
+static uint32_t            *g_attached_ids = NULL;
+static int                  g_attached_n   = 0;
+static int                  g_attached_cap = 0;
+
+static int attached_mark(uint32_t prog_id) {
+    if (!prog_id) return 0;
+    for (int i = 0; i < g_attached_n; i++)
+        if (g_attached_ids[i] == prog_id) return 0;
+    if (g_attached_n == g_attached_cap) {
+        if (g_attached_cap > INT_MAX / 2) return -1;
+        int newcap = g_attached_cap ? g_attached_cap * 2 : 64;
+        void *p = realloc(g_attached_ids, (size_t)newcap * sizeof(*g_attached_ids));
+        if (!p) return -1;
+        g_attached_ids = p;
+        g_attached_cap = newcap;
+    }
+    g_attached_ids[g_attached_n++] = prog_id;
+    return 0;
+}
+
+static int attached_contains(uint32_t prog_id) {
+    for (int i = 0; i < g_attached_n; i++)
+        if (g_attached_ids[i] == prog_id) return 1;
+    return 0;
+}
 
 static int attaches_push(uint32_t prog_id, const char *name, const char *kind,
                           const char *source, uint64_t offset, uint64_t address) {
@@ -446,6 +472,7 @@ static void load_task_fd_attaches(void) {
             /* A truncated pathname/symbol is not an authoritative target name. */
             if (rc < 0) continue;
             if (a.prog_id == 0) continue;
+            if (attached_mark(a.prog_id) < 0) g_attach_partial = 1;
 
             namebuf[sizeof(namebuf) - 1] = '\0';
             const char *kind;
@@ -467,8 +494,12 @@ static void load_task_fd_attaches(void) {
 }
 
 
-#define LINK_TYPE_RAW_TP    1
-#define LINK_TYPE_PERF_EV   7
+#define LINK_TYPE_RAW_TP         1
+#define LINK_TYPE_PERF_EV        7
+#define LINK_TYPE_KPROBE_MULTI   8
+#define LINK_TYPE_UPROBE_MULTI  12
+#define LINK_TYPE_TRACING_MULTI 15
+#define MULTI_QUERY_MAX    (1u << 20)
 
 #define BPF_PE_UPROBE       1
 #define BPF_PE_URETPROBE    2
@@ -511,6 +542,32 @@ struct link_info_buf {
                 } tracepoint;
             };
         } perf_event;
+        struct {
+            uint64_t addrs;
+            uint32_t count;
+            uint32_t flags;
+            uint64_t missed;
+            uint64_t cookies;
+        } kprobe_multi;
+        struct {
+            uint64_t path;
+            uint64_t offsets;
+            uint64_t ref_ctr_offsets;
+            uint64_t cookies;
+            uint32_t path_size;
+            uint32_t count;
+            uint32_t flags;
+            uint32_t pid;
+        } uprobe_multi;
+        struct {
+            uint32_t attach_type;
+            uint32_t count;
+            uint32_t btf_obj_id;
+            uint32_t _pad2;
+            uint64_t ids;
+            uint64_t addrs;
+            uint64_t cookies;
+        } tracing_multi;
         uint8_t _pad[176];
     };
 };
@@ -524,6 +581,74 @@ static int link_query_info(int fd, struct link_info_buf *info) {
     return bpf_call(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr));
 }
 
+static void query_kprobe_multi(int fd, struct link_info_buf *info) {
+    uint32_t count = info->kprobe_multi.count;
+    if (!count || count > MULTI_QUERY_MAX) { g_attach_partial = 1; return; }
+    uint64_t *addrs = calloc(count, sizeof(*addrs));
+    if (!addrs) { g_attach_partial = 1; return; }
+    info->kprobe_multi.addrs = (uint64_t)(uintptr_t)addrs;
+    info->kprobe_multi.count = count;
+    if (link_query_info(fd, info) < 0) {
+        g_attach_partial = 1;
+    } else {
+        const char *kind = (info->kprobe_multi.flags & 1u) ? "kretprobe_multi" : "kprobe_multi";
+        for (uint32_t i = 0; i < count; i++)
+            if (attaches_push(info->prog_id, "", kind, "bpf_link", 0, addrs[i]) < 0)
+                g_attach_partial = 1;
+    }
+    free(addrs);
+}
+
+static void query_uprobe_multi(int fd, struct link_info_buf *info) {
+    uint32_t count = info->uprobe_multi.count;
+    uint32_t path_size = info->uprobe_multi.path_size;
+    if (!count || count > MULTI_QUERY_MAX || !path_size || path_size > 1024u * 1024u) {
+        g_attach_partial = 1; return;
+    }
+    uint64_t *offsets = calloc(count, sizeof(*offsets));
+    char *path = calloc(path_size, 1);
+    if (!offsets || !path) { free(offsets); free(path); g_attach_partial = 1; return; }
+    info->uprobe_multi.path = (uint64_t)(uintptr_t)path;
+    info->uprobe_multi.path_size = path_size;
+    info->uprobe_multi.offsets = (uint64_t)(uintptr_t)offsets;
+    info->uprobe_multi.count = count;
+    if (link_query_info(fd, info) < 0 || path[path_size - 1] != '\0') {
+        g_attach_partial = 1;
+    } else {
+        const char *kind = (info->uprobe_multi.flags & 1u) ? "uretprobe_multi" : "uprobe_multi";
+        for (uint32_t i = 0; i < count; i++)
+            if (attaches_push(info->prog_id, path, kind, "bpf_link", offsets[i], 0) < 0)
+                g_attach_partial = 1;
+    }
+    free(offsets);
+    free(path);
+}
+
+static void query_tracing_multi(int fd, struct link_info_buf *info) {
+    uint32_t count = info->tracing_multi.count;
+    if (!count || count > MULTI_QUERY_MAX) { g_attach_partial = 1; return; }
+    uint32_t *ids = calloc(count, sizeof(*ids));
+    uint64_t *addrs = calloc(count, sizeof(*addrs));
+    if (!ids || !addrs) { free(ids); free(addrs); g_attach_partial = 1; return; }
+    info->tracing_multi.ids = (uint64_t)(uintptr_t)ids;
+    info->tracing_multi.addrs = (uint64_t)(uintptr_t)addrs;
+    info->tracing_multi.count = count;
+    if (link_query_info(fd, info) < 0) {
+        g_attach_partial = 1;
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            const char *kind = "kernel_function";
+            const char *name = btf_resolve_target(info->tracing_multi.btf_obj_id,
+                                                   ids[i], 0, &kind);
+            if (attaches_push(info->prog_id, name ? name : "", kind,
+                              "bpf_link", 0, addrs[i]) < 0)
+                g_attach_partial = 1;
+        }
+    }
+    free(ids);
+    free(addrs);
+}
+
 static void load_bpf_links(void) {
     uint32_t id = 0;
 
@@ -531,18 +656,23 @@ static void load_bpf_links(void) {
         union bpf_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.start_id = id;
-        if (bpf_call(BPF_LINK_GET_NEXT_ID, &attr, sizeof(attr)) < 0)
+        if (bpf_call(BPF_LINK_GET_NEXT_ID, &attr, sizeof(attr)) < 0) {
+            if (errno != ENOENT && errno != EINVAL && errno != ENOSYS)
+                g_attach_partial = 1;
             break;
+        }
+        if (attr.next_id <= id) { g_attach_partial = 1; break; }
         id = attr.next_id;
 
         memset(&attr, 0, sizeof(attr));
         attr.start_id = id;
         int fd = bpf_call(BPF_LINK_GET_FD_BY_ID, &attr, sizeof(attr));
-        if (fd < 0) continue;
+        if (fd < 0) { g_attach_partial = 1; continue; }
 
         struct link_info_buf info;
         memset(&info, 0, sizeof(info));
-        if (link_query_info(fd, &info) < 0) { close(fd); continue; }
+        if (link_query_info(fd, &info) < 0) { g_attach_partial = 1; close(fd); continue; }
+        if (attached_mark(info.prog_id) < 0) g_attach_partial = 1;
 
         char namebuf[256];
         namebuf[0] = '\0';
@@ -584,6 +714,15 @@ static void load_bpf_links(void) {
                 break;
             }
             break;
+        case LINK_TYPE_KPROBE_MULTI:
+            query_kprobe_multi(fd, &info);
+            break;
+        case LINK_TYPE_UPROBE_MULTI:
+            query_uprobe_multi(fd, &info);
+            break;
+        case LINK_TYPE_TRACING_MULTI:
+            query_tracing_multi(fd, &info);
+            break;
         }
         close(fd);
 
@@ -598,6 +737,10 @@ static void attaches_free(void) {
     g_attaches     = NULL;
     g_attaches_n   = 0;
     g_attaches_cap = 0;
+    free(g_attached_ids);
+    g_attached_ids = NULL;
+    g_attached_n = 0;
+    g_attached_cap = 0;
 }
 
 /* ── Hook classification ─────────────────────────────────────────────────── */
@@ -639,12 +782,14 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
         printf("\"ebpf_hooks\":[");
 
     g_btf_partial = 0;
+    g_attach_partial = 0;
     load_kernel_btf();
     load_bpf_links();
     load_task_fd_attaches();
 
     uint32_t id            = 0;
     int      n_hooks       = 0;
+    int      n_allowed     = 0;
     int      printed       = 0;
     int      n_seen        = 0;     /* total programs the kernel listed */
     int      n_skipped     = 0;     /* programs we couldn't query */
@@ -676,6 +821,12 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
                 fprintf(stderr, "[!] BPF_PROG_GET_NEXT_ID failed: %s (id=%u, stopping)\n",
                         strerror(errno), id);
             if (incomplete) *incomplete = 1;
+            break;
+        }
+        if (attr.next_id <= id) {
+            if (incomplete) *incomplete = 1;
+            if (!config->json_output)
+                fprintf(stderr, "[!] BPF program enumeration returned a non-increasing ID\n");
             break;
         }
         id = attr.next_id;
@@ -714,21 +865,21 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
 
         /* Kernel attach metadata describes targets. Program func_info describes
          * the BPF callback itself and must never be promoted to a target. */
+        int is_attached = attached_contains(info.id);
         const char *target_kind = "kernel_function";
         const char *target = btf_resolve_target(info.attach_btf_obj_id,
                                                info.attach_btf_id,
                                                info.type == BPF_PROG_TYPE_TRACING,
                                                &target_kind);
-        if (target)
-            attaches_push(info.id, target, target_kind, "attach_btf", 0, 0);
+        if (is_attached && target)
+            if (attaches_push(info.id, target, target_kind, "attach_btf", 0, 0) < 0)
+                g_attach_partial = 1;
         const char *callback = btf_resolve_prog(&info, fd);
         close(fd);
 
         char prog_name[BPF_OBJ_NAME_LEN + 1];
         memcpy(prog_name, info.name, BPF_OBJ_NAME_LEN);
         prog_name[BPF_OBJ_NAME_LEN] = '\0';
-        n_hooks++;
-
         const struct attach_entry *first = NULL;
         const char *kernel_function = NULL;
         int n_targets = 0;
@@ -741,6 +892,24 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
                 !strcmp(entry->kind, "kprobe") || !strcmp(entry->kind, "kretprobe")))
                 kernel_function = entry->name;
         }
+        int allowed = is_attached && policy_allows(config, "ebpf", prog_name, "");
+        if (n_targets) {
+            allowed = is_attached;
+            for (int i = 0; i < g_attaches_n; i++) {
+                const struct attach_entry *entry = &g_attaches[i];
+                if (entry->prog_id == info.id) {
+                    char address[32];
+                    const char *identity = entry->name;
+                    if (!identity[0]) {
+                        snprintf(address, sizeof(address), "0x%" PRIx64, entry->address);
+                        identity = address;
+                    }
+                    if (!policy_allows(config, "ebpf", prog_name, identity)) allowed = 0;
+                }
+            }
+        }
+        n_hooks += is_attached && !allowed;
+        n_allowed += is_attached && allowed;
         if (config->json_output) {
             if (printed > 0) printf(",");
             printf("{");
@@ -762,13 +931,20 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
                        ",\"address\":%" PRIu64 "}", entry->kind, entry->source,
                        entry->offset, entry->address);
             }
-            printf("],\"attach_btf_obj_id\":%u,\"attach_btf_id\":%u,"
-                   "\"uid\":%u,\"benign\":false}", info.attach_btf_obj_id,
-                   info.attach_btf_id, info.created_by_uid);
-        } else {
-            printf("  %-48s [%-16s] prog=%s\n",
-                   first && first->name[0] ? first->name : "<target unresolved>",
-                   prog_type_str(info.type), prog_name[0] ? prog_name : "<unnamed>");
+            printf("],\"attached\":%s,\"attachment_status\":\"%s\",\"attach_btf_obj_id\":%u,"
+                   "\"attach_btf_id\":%u,\"uid\":%u,\"signal\":%s,\"benign\":%s,\"allowed\":%s}",
+                   is_attached ? "true" : "false",
+                   is_attached ? "confirmed" : "not_proven",
+                   info.attach_btf_obj_id, info.attach_btf_id, info.created_by_uid,
+                   is_attached && !allowed ? "true" : "false",
+                   !is_attached || allowed ? "true" : "false",
+                   allowed ? "true" : "false");
+        } else if (is_attached || config->verbose) {
+            printf("  %-48s [%-16s] prog=%s%s\n",
+                   first && first->name[0] ? first->name :
+                   is_attached ? "<target unresolved>" : "<loaded; attachment not proven>",
+                   prog_type_str(info.type), prog_name[0] ? prog_name : "<unnamed>",
+                   allowed ? " [ALLOW]" : "");
             for (int i = 0; i < g_attaches_n; i++) {
                 const struct attach_entry *entry = &g_attaches[i];
                 if (entry->prog_id != info.id) continue;
@@ -778,7 +954,7 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
             }
             if (callback) printf("    BPF callback=%s\n", callback);
         }
-        printed++;
+        if (config->json_output || is_attached || config->verbose) printed++;
     }
 
     if (config->json_output) {
@@ -798,8 +974,13 @@ int scan_ebpf_programs(const Config *config, int *incomplete) {
         if (n_skipped > 0 && n_hooks == 0)
             printf("[!] %d program(s) could not be queried (rerun with -v for details)\n",
                    n_skipped);
+        if (n_allowed)
+            printf("[*] %d hook-capable eBPF program(s) allowed by policy\n", n_allowed);
     }
 
+    if (g_attach_partial && incomplete) *incomplete = 1;
+    if (!config->json_output && g_attach_partial)
+        fprintf(stderr, "[!] eBPF attachment discovery partial; some targets or attachment states may be missing\n");
     if (!config->json_output && g_btf_partial)
         fprintf(stderr, "[!] BTF resolution partial: kernel uses a BTF kind this build doesn't know;"
                        " some kernel function names may be missing\n");
